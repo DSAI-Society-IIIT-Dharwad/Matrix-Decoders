@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     enable_tts: bool = True
     enable_tts_fallback_tone: bool = True
     tts_sample_rate: int = 22050
+    indic_tts_command_template: str = ""
+    indic_tts_voice_hi: str = ""
+    indic_tts_voice_kn: str = ""
     piper_binary: str = ""
     piper_voice_en: str = ""
     piper_voice_hi: str = ""

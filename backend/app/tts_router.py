@@ -3,6 +3,7 @@ import base64
 import io
 import math
 import os
+import shlex
 import shutil
 import struct
 import subprocess
@@ -76,8 +77,78 @@ class BaseTTSProvider:
     def is_available(self) -> bool:
         return False
 
+    def supports_language(self, language: str) -> bool:
+        return True
+
     def synthesize(self, text: str, language: str) -> TTSResult:
         raise NotImplementedError
+
+
+class IndicTTSProvider(BaseTTSProvider):
+    name = "ai4bharat-indic"
+
+    def __init__(self):
+        self._command_template = settings.indic_tts_command_template.strip()
+
+    def is_available(self) -> bool:
+        return bool(
+            self._command_template
+            and (
+                _voice_path_for_language("indic", "hi")
+                or _voice_path_for_language("indic", "kn")
+            )
+        )
+
+    def supports_language(self, language: str) -> bool:
+        return language in {"hi", "kn"}
+
+    def synthesize(self, text: str, language: str) -> TTSResult:
+        if not self._command_template:
+            raise RuntimeError("AI4Bharat Indic-TTS command template is not configured.")
+
+        voice_path = _voice_path_for_language("indic", language)
+        if not voice_path:
+            raise RuntimeError(f"No AI4Bharat Indic-TTS voice configured for language '{language}'.")
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as output_file:
+            output_path = output_file.name
+
+        try:
+            command = self._build_command(language, voice_path, output_path)
+            proc = subprocess.run(
+                command,
+                input=text.encode("utf-8"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    proc.stderr.decode("utf-8", errors="ignore").strip()
+                    or "AI4Bharat Indic-TTS synthesis failed."
+                )
+
+            with open(output_path, "rb") as f:
+                audio_bytes = f.read()
+
+            return TTSResult(
+                text=text,
+                language=language,
+                provider=self.name,
+                audio_bytes=audio_bytes,
+                sample_rate=settings.tts_sample_rate,
+            )
+        finally:
+            if os.path.exists(output_path):
+                os.remove(output_path)
+
+    def _build_command(self, language: str, voice_path: str, output_path: str) -> list[str]:
+        rendered = self._command_template.format(
+            language=language,
+            voice=voice_path,
+            output_path=output_path,
+        )
+        return shlex.split(rendered, posix=False)
 
 
 class PiperTTSProvider(BaseTTSProvider):
@@ -87,7 +158,10 @@ class PiperTTSProvider(BaseTTSProvider):
         self._binary = settings.piper_binary or shutil.which("piper")
 
     def is_available(self) -> bool:
-        return bool(self._binary and _voice_path_for_language("piper", "en"))
+        return bool(self._binary and any(_voice_path_for_language("piper", lang) for lang in ("en", "hi", "kn")))
+
+    def supports_language(self, language: str) -> bool:
+        return _voice_path_for_language("piper", language) is not None
 
     def synthesize(self, text: str, language: str) -> TTSResult:
         if not self._binary:
@@ -130,33 +204,39 @@ class CoquiTTSProvider(BaseTTSProvider):
     name = "coqui"
 
     def __init__(self):
-        self._tts = None
+        self._tts_models: dict[str, object] = {}
 
-    def _load(self):
-        if self._tts is not None:
-            return self._tts
+    def _load(self, language: str):
+        model_name = _voice_path_for_language("coqui", language)
+        if not model_name:
+            raise RuntimeError(f"No Coqui model configured for language '{language}'.")
+
+        if model_name in self._tts_models:
+            return self._tts_models[model_name]
 
         try:
             from TTS.api import TTS  # type: ignore
         except Exception as exc:  # pragma: no cover - optional dependency
             raise RuntimeError(f"Coqui TTS is not installed: {exc}") from exc
 
-        model_name = _voice_path_for_language("coqui", "en")
-        if not model_name:
-            raise RuntimeError("Coqui model name not configured.")
-
-        self._tts = TTS(model_name=model_name)
-        return self._tts
+        self._tts_models[model_name] = TTS(model_name=model_name)
+        return self._tts_models[model_name]
 
     def is_available(self) -> bool:
         try:
-            self._load()
-            return True
+            for language in ("en", "hi", "kn"):
+                if _voice_path_for_language("coqui", language):
+                    self._load(language)
+                    return True
+            return False
         except Exception:
             return False
 
+    def supports_language(self, language: str) -> bool:
+        return _voice_path_for_language("coqui", language) is not None
+
     def synthesize(self, text: str, language: str) -> TTSResult:
-        tts = self._load()
+        tts = self._load(language)
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as output_file:
             output_path = output_file.name
@@ -218,7 +298,12 @@ class ToneFallbackProvider(BaseTTSProvider):
 
 
 def _voice_path_for_language(provider: str, language: str) -> Optional[str]:
-    if provider == "piper":
+    if provider == "indic":
+        mapping = {
+            "hi": settings.indic_tts_voice_hi,
+            "kn": settings.indic_tts_voice_kn,
+        }
+    elif provider == "piper":
         mapping = {
             "en": settings.piper_voice_en,
             "hi": settings.piper_voice_hi,
@@ -240,6 +325,7 @@ class TTSRouter:
 
     def __init__(self):
         self.providers = [
+            IndicTTSProvider(),
             PiperTTSProvider(),
             CoquiTTSProvider(),
             ToneFallbackProvider(),
@@ -270,6 +356,8 @@ class TTSRouter:
         last_error = None
         for provider in self.providers:
             if not provider.is_available():
+                continue
+            if not provider.supports_language(language):
                 continue
 
             try:
