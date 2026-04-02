@@ -92,6 +92,23 @@ class Orchestrator:
         response_text = clean_transcript(response_text)
         sentences = split_sentences(response_text)
         tts_language = choose_response_language(response_text, languages)
+        tts_segments = []
+        for sentence in sentences:
+            sentence_languages = detect_scripts(sentence)
+            sentence_languages.discard("unknown")
+            if not sentence_languages:
+                sentence_languages = set(languages or {"en"})
+            tts_segments.append(
+                {
+                    "text": sentence,
+                    "languages": sorted(sentence_languages),
+                    "language": choose_response_language(
+                        sentence,
+                        sorted(sentence_languages),
+                        preferred_language=tts_language,
+                    ),
+                }
+            )
 
         yield {
             "type": "final",
@@ -100,6 +117,7 @@ class Orchestrator:
             "languages": list(languages),
             "is_code_mixed": code_mixed,
             "tts_plan": sentences,
+            "tts_segments": tts_segments,
             "tts_language": tts_language,
         }
 
@@ -132,6 +150,7 @@ class Orchestrator:
             yield {
                 "type": "transcription",
                 "text": result.text,
+                "language": result.dominant_language,
                 "languages": list(result.languages),
                 "is_code_mixed": result.is_code_mixed,
                 "segments": result.segments,

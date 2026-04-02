@@ -10,9 +10,10 @@ from starlette.websockets import WebSocketDisconnect, WebSocketState
 from .logger import get_logger
 from .memory import store
 from .orchestrator import Orchestrator
+from .audio_utils import AudioFormatConfig, trim_pcm16_silence
 from .schemas import ChatRequest, ChatResponse, HealthResponse, TTSRequest, TTSResponse
 from .transcript_cleaner import clean_transcript
-from .tts_router import tts_router
+from .tts_router import TTSSegmentInput, tts_router
 
 log = get_logger("api")
 
@@ -21,7 +22,49 @@ orch = Orchestrator()
 
 _start_time = time.time()
 _ALLOWED_AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg", ".webm", ".flac"}
-_MAX_AUDIO_WS_CHUNK_BYTES = 16000 * 2
+
+
+def _build_tts_segment_inputs(
+    raw_segments,
+    fallback_text: str,
+    fallback_languages=None,
+    fallback_language=None,
+) -> list[TTSSegmentInput]:
+    inputs: list[TTSSegmentInput] = []
+
+    for segment in raw_segments or []:
+        if isinstance(segment, str) and segment.strip():
+            inputs.append(
+                TTSSegmentInput(
+                    text=segment.strip(),
+                    language=fallback_language,
+                    languages=fallback_languages,
+                )
+            )
+        elif isinstance(segment, dict):
+            text = clean_transcript(str(segment.get("text", "")))
+            if text:
+                languages = segment.get("languages")
+                if not isinstance(languages, list):
+                    languages = fallback_languages
+                inputs.append(
+                    TTSSegmentInput(
+                        text=text,
+                        language=segment.get("language") or segment.get("dominant_language") or fallback_language,
+                        languages=languages,
+                    )
+                )
+
+    if inputs:
+        return inputs
+
+    return [
+        TTSSegmentInput(
+            text=fallback_text,
+            language=fallback_language,
+            languages=fallback_languages,
+        )
+    ]
 
 
 @router.get("/api/health", response_model=HealthResponse)
@@ -129,8 +172,14 @@ async def synthesize_speech(request: TTSRequest):
         return JSONResponse(status_code=400, content={"error": "TTS input cannot be empty."})
 
     try:
-        result = await tts_router.synthesize(
+        segments = _build_tts_segment_inputs(
+            None,
             cleaned_text,
+            fallback_languages=request.languages,
+            fallback_language=request.language,
+        )
+        result = await tts_router.synthesize_segments(
+            segments,
             languages=request.languages,
             preferred_language=request.language,
         )
@@ -211,10 +260,10 @@ async def audio_ws(ws: WebSocket, session_id: str):
     log.info(f"Audio WebSocket connected: session={session_id}")
 
     audio_buffer = bytearray()
+    audio_config = AudioFormatConfig()
     last_audio_time = time.time()
 
     silence_timeout = 1.2
-    max_buffer_size = 16000 * 2 * 3  # ~3 seconds of 16-bit 16kHz mono
 
     async def flush_audio_buffer():
         nonlocal audio_buffer
@@ -222,19 +271,28 @@ async def audio_ws(ws: WebSocket, session_id: str):
         if not audio_buffer:
             return
 
-        log.info(f"Processing audio ({len(audio_buffer)} bytes)...")
+        pcm_audio = trim_pcm16_silence(bytes(audio_buffer), channels=audio_config.channels)
+        audio_buffer.clear()
+
+        if not pcm_audio:
+            if ws.client_state == WebSocketState.CONNECTED:
+                await ws.send_json({"type": "audio_skipped", "reason": "silence"})
+            return
+
+        log.info(
+            "Processing audio "
+            f"({len(pcm_audio)} bytes, {audio_config.sample_rate}Hz, {audio_config.channels}ch)..."
+        )
 
         os.makedirs("temp_audio", exist_ok=True)
         temp_path = f"temp_audio/{session_id}_{int(time.time())}.wav"
 
         try:
             with wave.open(temp_path, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(16000)
-                wf.writeframes(audio_buffer)
-
-            audio_buffer.clear()
+                wf.setnchannels(audio_config.channels)
+                wf.setsampwidth(audio_config.sample_width)
+                wf.setframerate(audio_config.sample_rate)
+                wf.writeframes(pcm_audio)
 
             async for event in orch.process_audio(session_id, temp_path):
                 if ws.client_state == WebSocketState.CONNECTED:
@@ -259,21 +317,22 @@ async def audio_ws(ws: WebSocket, session_id: str):
 
             if "bytes" in data and data["bytes"] is not None:
                 chunk = data["bytes"]
+                max_chunk_bytes = audio_config.max_chunk_bytes()
 
-                if len(chunk) > _MAX_AUDIO_WS_CHUNK_BYTES:
+                if len(chunk) > max_chunk_bytes:
                     await ws.send_json(
                         {
                             "type": "error",
-                            "error": f"Audio chunk too large ({len(chunk)} bytes). Max allowed is {_MAX_AUDIO_WS_CHUNK_BYTES}.",
+                            "error": f"Audio chunk too large ({len(chunk)} bytes). Max allowed is {max_chunk_bytes} for the negotiated audio format.",
                         }
                     )
                     continue
 
-                if len(chunk) % 2 != 0:
+                if len(chunk) % audio_config.frame_size != 0:
                     await ws.send_json(
                         {
                             "type": "error",
-                            "error": "Invalid PCM frame received. Expected 16-bit mono audio chunks.",
+                            "error": "Invalid PCM frame received. Expected complete 16-bit PCM frames for the negotiated channel count.",
                         }
                     )
                     continue
@@ -283,7 +342,46 @@ async def audio_ws(ws: WebSocket, session_id: str):
                 log.debug(f"Buffer: {len(audio_buffer)} bytes")
 
             elif "text" in data and data["text"] is not None:
-                command = data["text"].strip().lower()
+                raw_text = data["text"].strip()
+                command = raw_text.lower()
+
+                try:
+                    payload = json.loads(raw_text)
+                except json.JSONDecodeError:
+                    payload = None
+
+                if isinstance(payload, dict):
+                    message_type = str(payload.get("type", "")).lower()
+
+                    if message_type in {"start", "config"}:
+                        try:
+                            audio_config = AudioFormatConfig.from_message(payload)
+                        except ValueError as e:
+                            await ws.send_json({"type": "error", "error": str(e)})
+                            continue
+
+                        await ws.send_json(
+                            {
+                                "type": "audio_config",
+                                "sample_rate": audio_config.sample_rate,
+                                "channels": audio_config.channels,
+                                "sample_width": audio_config.sample_width,
+                                "encoding": audio_config.encoding,
+                                "max_chunk_bytes": audio_config.max_chunk_bytes(),
+                            }
+                        )
+                        continue
+
+                    if message_type == "commit":
+                        await flush_audio_buffer()
+                        continue
+                    if message_type == "reset":
+                        audio_buffer.clear()
+                        await ws.send_json({"type": "audio_reset"})
+                        continue
+                    if message_type == "ping":
+                        await ws.send_json({"type": "pong"})
+                        continue
 
                 if command == "commit":
                     await flush_audio_buffer()
@@ -305,6 +403,7 @@ async def audio_ws(ws: WebSocket, session_id: str):
                 continue
 
             current_time = time.time()
+            max_buffer_size = audio_config.max_buffer_bytes()
             if audio_buffer and (
                 (current_time - last_audio_time > silence_timeout)
                 or len(audio_buffer) >= max_buffer_size
@@ -352,9 +451,12 @@ async def tts_ws(ws: WebSocket, session_id: str):
                 await ws.send_json({"type": "error", "error": "TTS input cannot be empty."})
                 continue
 
-            segments = [segment for segment in msg.get("segments", []) if isinstance(segment, str) and segment.strip()]
-            if not segments:
-                segments = [cleaned_text]
+            segments = _build_tts_segment_inputs(
+                msg.get("segments"),
+                cleaned_text,
+                fallback_languages=msg.get("languages"),
+                fallback_language=msg.get("language"),
+            )
 
             await ws.send_json(
                 {
@@ -365,31 +467,44 @@ async def tts_ws(ws: WebSocket, session_id: str):
                 }
             )
 
-            for index, segment in enumerate(segments, start=1):
-                try:
-                    result = await tts_router.synthesize(
-                        segment,
-                        languages=msg.get("languages"),
-                        preferred_language=msg.get("language"),
-                    )
-                except Exception as e:
-                    await ws.send_json({"type": "error", "error": str(e), "segment_index": index})
-                    break
+            try:
+                result = await tts_router.synthesize_segments(
+                    segments,
+                    languages=msg.get("languages"),
+                    preferred_language=msg.get("language"),
+                )
+            except Exception as e:
+                await ws.send_json({"type": "error", "error": str(e)})
+                continue
 
+            for segment_result in result.segments:
                 await ws.send_json(
                     {
                         "type": "audio_chunk",
-                        "segment_index": index,
-                        "text": result.text,
-                        "language": result.language,
-                        "provider": result.provider,
-                        "mime_type": result.mime_type,
-                        "sample_rate": result.sample_rate,
-                        "audio_b64": result.audio_b64,
+                        "segment_index": segment_result.index,
+                        "text": segment_result.text,
+                        "language": segment_result.language,
+                        "provider": segment_result.provider,
+                        "mime_type": segment_result.mime_type,
+                        "sample_rate": segment_result.sample_rate,
+                        "duration_ms": segment_result.duration_ms,
+                        "audio_b64": segment_result.audio_b64,
                     }
                 )
-            else:
-                await ws.send_json({"type": "final", "status": "ok"})
+
+            await ws.send_json(
+                {
+                    "type": "final",
+                    "status": "ok",
+                    "text": result.text,
+                    "language": result.language,
+                    "provider": result.provider,
+                    "mime_type": result.mime_type,
+                    "sample_rate": result.sample_rate,
+                    "segment_count": len(result.segments),
+                    "audio_b64": result.audio_b64,
+                }
+            )
 
     except WebSocketDisconnect:
         log.info(f"TTS WebSocket disconnected: session={session_id}")

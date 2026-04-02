@@ -24,6 +24,8 @@ class TranscriptSegment(BaseModel):
 
     index: Optional[int] = None
     text: str
+    start_ms: Optional[int] = None
+    end_ms: Optional[int] = None
     language: Optional[str] = None
     languages: Optional[List[str]] = None
     dominant_language: Optional[str] = None
@@ -80,6 +82,7 @@ class OrchestratorEvent(BaseModel):
     is_code_mixed: Optional[bool] = None
     segments: Optional[List[TranscriptSegment]] = None
     tts_plan: Optional[List[str]] = None
+    tts_segments: Optional[List[dict]] = None
     tts_language: Optional[str] = None
     provider: Optional[str] = None
     mime_type: Optional[str] = None

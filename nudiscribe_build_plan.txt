@@ -1,0 +1,321 @@
+
+
+## 1) Exact system shape
+
+The system should work like this:
+
+1. User speaks in Kannada, English, Hindi, or mixed speech.
+2. Frontend sends audio chunks over WebSocket.
+3. Backend normalizes audio and routes it.
+4. English-heavy segments go to **Whisper**.
+5. Kannada/Hindi/other Indian-language segments go to **IndicConformer**.
+6. The transcript is cleaned and language-tagged.
+7. The response generator runs through **Ollama** and streams tokens back.
+8. The final response is converted to speech through **Indic-TTS** for Kannada/Hindi or **Coqui TTS** for English/fallback output.
+9. Text and audio both stream back to the frontend. ([GitHub][1])
+
+For **code-mixed speech**, the most practical approach is not “one model magically solves everything,” but **chunk-level routing**: detect the dominant language per chunk, send it to the best ASR, then merge the transcript. That is an engineering inference built on Whisper’s language identification and IndicConformer’s Indian-language coverage. ([GitHub][1])
+
+## 2) Orchestration logic
+
+### Stage A — Capture and stream audio
+
+**Prerequisites:** browser microphone permission, WebSocket connection, audio recording in small chunks, and a backend endpoint that can receive binary frames.
+
+**Process:**
+
+* Capture microphone audio continuously.
+* Send short chunks instead of waiting for the full recording.
+* Keep a session id so the backend can maintain context.
+* Use a fixed sample format across the pipeline.
+
+### Stage B — Normalize audio
+
+**Prerequisites:** audio decoder, resampler, mono-channel conversion.
+
+**Process:**
+
+* Decode incoming audio.
+* Convert to one channel.
+* Normalize amplitude.
+* Resample to the format expected by your ASR backends.
+  AI4Bharat’s Kannada IndicConformer model is documented for **16 kHz mono-channel audio inputs**, so normalizing to that format is a safe choice for the Indian-language side of the router. ([aikosh.indiaai.gov.in][2])
+
+### Stage C — Voice activity detection and segmenting
+
+**Prerequisites:** VAD library or energy-based chunking, silence thresholds, segment buffer.
+
+**Process:**
+
+* Detect speech start.
+* Keep collecting until silence or chunk end.
+* Merge tiny fragments.
+* Split long audio into manageable segments.
+
+This stage matters because code-mixed speech is easier to route when you work on **segments**, not one huge blob.
+
+### Stage D — Language routing
+
+**Prerequisites:** language-id metadata, confidence threshold, fallback rule.
+
+**Process:**
+
+* Run a quick language check.
+* If the segment is English-heavy, route to Whisper.
+* If it is Kannada/Hindi/other Indian-language heavy, route to IndicConformer.
+* If confidence is low, try both in fallback order and pick the better transcript.
+
+Whisper supports multilingual recognition and language identification, while IndicConformer covers all 22 official Indian languages, so they complement each other well in a router-based design. ([GitHub][1])
+
+### Stage E — Transcript cleanup
+
+**Prerequisites:** punctuation restoration rule set, normalization rules, optional transliteration.
+
+**Process:**
+
+* Fix spacing and punctuation.
+* Normalize numbers, dates, and abbreviations.
+* Tag each segment with language metadata.
+* Merge final transcript from multiple ASR outputs.
+
+This is where you make the transcript readable before sending it to the LLM.
+
+### Stage F — LLM orchestration
+
+**Prerequisites:** Ollama running locally, model pulled into Ollama, prompt templates, conversation state.
+
+**Process:**
+
+* Build a prompt from the cleaned transcript.
+* Add system instructions in the target language.
+* Feed the prompt to Ollama.
+* Stream the response tokens back to the backend.
+
+Ollama’s API supports streaming responses by default, and its docs explicitly show streamed generation for `/api/generate`. ([Ollama][3])
+
+### Stage G — Response language planning
+
+**Prerequisites:** response language policy, sentence splitter, TTS routing table.
+
+**Process:**
+
+* Decide whether the assistant should answer in English, Kannada, Hindi, or a mixed format.
+* Split the output into sentences or clauses.
+* Route each piece to the matching TTS engine.
+* Reassemble audio in order.
+
+### Stage H — Speech synthesis
+
+**Prerequisites:** TTS backend, model files, audio output encoder.
+
+**Process:**
+
+* Use **AI4Bharat Indic-TTS** for Kannada and Hindi speech output.
+* Use **Coqui TTS** for English or fallback multilingual speech output.
+* Stream audio chunks back when possible.
+
+AI4Bharat Indic-TTS explicitly lists Kannada and Hindi among its Indian-language TTS models, and Coqui TTS advertises pretrained models in more than 1100 languages. ([GitHub][4])
+
+## 3) Build order that will not waste time
+
+### Phase 1 — Build the core text pipeline first
+
+**Prerequisites:** Python environment, FastAPI, Ollama, and a working model in Ollama.
+
+Build only:
+
+* frontend text input
+* WebSocket backend
+* Ollama streaming
+* text response display
+
+Do this before touching audio. FastAPI’s WebSocket support and Ollama streaming make this the fastest stable base layer. ([fastapi.tiangolo.com][5])
+
+### Phase 2 — Add Whisper for English speech
+
+**Prerequisites:** microphone capture, audio-to-file or audio-to-buffer conversion, Whisper model downloaded.
+
+Build:
+
+* push-to-talk or continuous recording
+* Whisper transcription
+* transcript display
+
+Whisper is a general-purpose multilingual ASR model trained for speech recognition, translation, and language identification. ([GitHub][1])
+
+### Phase 3 — Add IndicConformer for Kannada and Hindi
+
+**Prerequisites:** IndicConformer runtime, 16 kHz mono audio path, language router.
+
+Build:
+
+* language detector
+* Kannada/Hindi route
+* transcript merging
+
+AI4Bharat’s IndicConformer is built for the 22 official Indian languages, so it is the right branch for your Kannada/Hindi side. ([GitHub][6])
+
+### Phase 4 — Add code-mixed routing
+
+**Prerequisites:** segmenter, confidence thresholds, fallback ASR.
+
+Build:
+
+* break speech into segments
+* detect language per segment
+* route each segment separately
+* merge transcripts
+
+This is the step that makes the system feel multilingual instead of “two separate models glued together.”
+
+### Phase 5 — Add TTS
+
+**Prerequisites:** TTS engine, per-language routing map, audio playback in browser.
+
+Build:
+
+* Kannada/Hindi TTS with Indic-TTS
+* English fallback TTS with Coqui
+* stitch audio chunks
+* stream audio to frontend
+
+AI4Bharat Indic-TTS supports Kannada and Hindi, and Coqui TTS gives you a broad multilingual fallback layer. ([GitHub][4])
+
+### Phase 6 — Add conversation memory and persistence
+
+**Prerequisites:** PostgreSQL, SQLAlchemy, session schema.
+
+Build:
+
+* store session history
+* store transcripts
+* store selected language
+* store latency and errors
+
+### Phase 7 — Containerize and deploy
+
+**Prerequisites:** Docker, model volume mounting, GPU access if available.
+
+Build:
+
+* separate containers for frontend, backend, ASR, and TTS if needed
+* connect them with Docker Compose first
+* move to your deployment target later
+
+## 4) Suggested project structure
+
+```text
+multilingual-system/
+  backend/
+    app/
+      main.py
+      ws.py
+      config.py
+      models/
+      services/
+        audio_router.py
+        whisper_asr.py
+        indicconformer_asr.py
+        llm_orchestrator.py
+        tts_router.py
+        indic_tts.py
+        coqui_tts.py
+        transcript_cleaner.py
+    requirements.txt
+  frontend/
+    ...
+  docker-compose.yml
+  README.md
+```
+
+## 5) Build steps in order
+
+### 5.1 Environment
+
+**Prerequisites:** Ubuntu or Linux, Python 3.10+, git, ffmpeg, virtual environment tooling, and GPU if you want lower latency.
+
+Install the backend dependencies first. AI4Bharat’s Indic-TTS repo documents an environment that includes `libsndfile1-dev`, `ffmpeg`, and a Python/PyTorch setup on Ubuntu. Coqui TTS also documents local installation paths and Python support constraints. ([GitHub][4])
+
+### 5.2 Backend skeleton
+
+**Prerequisites:** FastAPI, Uvicorn, WebSocket client in frontend.
+
+Create:
+
+* `/ws/audio`
+* `/ws/tts`
+* `/health`
+* session state manager
+
+FastAPI documents WebSockets directly and shows connection handling patterns. ([fastapi.tiangolo.com][5])
+
+### 5.3 ASR router
+
+**Prerequisites:** Whisper model, IndicConformer model, language-id rule, fallback logic.
+
+Create functions:
+
+* `detect_language(audio_chunk)`
+* `transcribe_whisper(audio_chunk)`
+* `transcribe_indic(audio_chunk)`
+* `route_asr(audio_chunk)`
+
+### 5.4 Text pipeline
+
+**Prerequisites:** normalizer, segment merger, punctuation fixer.
+
+Create:
+
+* transcript cleaner
+* mixed-language tokenizer
+* response language policy
+
+### 5.5 LLM service
+
+**Prerequisites:** Ollama running locally, model pulled, prompt template.
+
+Create:
+
+* `build_prompt(transcript)`
+* `stream_llm_response(prompt)`
+* `accumulate_tokens()`
+
+Ollama’s streaming API is designed specifically for token-by-token generation. ([GitHub][7])
+
+### 5.6 TTS router
+
+**Prerequisites:** Indic-TTS runtime, Coqui runtime, audio encoder.
+
+Create:
+
+* `detect_response_language(text_segment)`
+* `speak_indic(text_segment)`
+* `speak_coqui(text_segment)`
+* `merge_audio_segments()`
+
+Indic-TTS is the right Indian-language output path, and Coqui TTS is the general fallback path. ([GitHub][4])
+
+### 5.7 Frontend
+
+**Prerequisites:** microphone access, WebSocket client, audio player, transcript area.
+
+Create:
+
+* record button
+* live transcript panel
+* live response panel
+* audio playback for TTS output
+
+## 6) Practical recommendation for your hackathon
+
+Use this first version:
+
+* **Whisper** for English-dominant speech
+* **IndicConformer** for Kannada/Hindi-dominant speech
+* **Ollama** for the LLM
+* **Indic-TTS** for Kannada/Hindi output
+* **Coqui TTS** for English output
+* **FastAPI WebSockets** for real-time streaming ([GitHub][1])
+
+
+
