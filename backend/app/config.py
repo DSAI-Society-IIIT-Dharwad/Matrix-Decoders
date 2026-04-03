@@ -1,4 +1,19 @@
-from pydantic_settings import BaseSettings
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+BACKEND_ROOT = REPO_ROOT / "backend"
+ENV_FILE_CANDIDATES = (
+    BACKEND_ROOT / ".env",
+    REPO_ROOT / ".env",
+)
+
+
+def existing_env_files() -> list[Path]:
+    """Return the configured env files that currently exist on disk."""
+    return [path for path in ENV_FILE_CANDIDATES if path.exists()]
 
 
 class Settings(BaseSettings):
@@ -16,9 +31,16 @@ class Settings(BaseSettings):
     enable_tts: bool = True
     enable_tts_fallback_tone: bool = True
     tts_sample_rate: int = 22050
+    indic_tts_python_bin: str = "python"
     indic_tts_command_template: str = ""
-    indic_tts_voice_hi: str = ""
-    indic_tts_voice_kn: str = ""
+    indic_tts_model_hi: str = ""
+    indic_tts_config_hi: str = ""
+    indic_tts_vocoder_hi: str = ""
+    indic_tts_vocoder_config_hi: str = ""
+    indic_tts_model_kn: str = ""
+    indic_tts_config_kn: str = ""
+    indic_tts_vocoder_kn: str = ""
+    indic_tts_vocoder_config_kn: str = ""
     piper_binary: str = ""
     piper_voice_en: str = ""
     piper_voice_hi: str = ""
@@ -28,9 +50,11 @@ class Settings(BaseSettings):
     coqui_model_kn: str = ""
     coqui_speaker: str = ""
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = SettingsConfigDict(
+        env_file=tuple(str(path) for path in ENV_FILE_CANDIDATES),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
 
 settings = Settings()

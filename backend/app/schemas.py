@@ -1,5 +1,6 @@
+from typing import List, Optional
+
 from pydantic import BaseModel, Field
-from typing import Optional, Set, List
 
 
 class ChatRequest(BaseModel):
@@ -14,7 +15,7 @@ class ChatResponse(BaseModel):
 
     text: str
     language: str
-    languages: List[str] = []
+    languages: List[str] = Field(default_factory=list)
     is_code_mixed: bool = False
     session_id: str
 
@@ -39,9 +40,9 @@ class TranscribeResponse(BaseModel):
 
     text: str
     language: str
-    languages: List[str] = []
+    languages: List[str] = Field(default_factory=list)
     is_code_mixed: bool = False
-    segments: List[TranscriptSegment] = []
+    segments: List[TranscriptSegment] = Field(default_factory=list)
 
 
 class HealthResponse(BaseModel):
@@ -51,6 +52,13 @@ class HealthResponse(BaseModel):
     model: str
     uptime_seconds: float
     sessions_active: int
+    tts_enabled: bool = False
+    tts_ready: bool = False
+    tts_providers: List[str] = Field(default_factory=list)
+    tts_real_speech_ready: bool = False
+    tts_real_providers: List[str] = Field(default_factory=list)
+    errors: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
 
 
 class TTSRequest(BaseModel):
@@ -58,7 +66,7 @@ class TTSRequest(BaseModel):
 
     text: str = Field(..., description="Text to synthesize")
     language: Optional[str] = Field(default=None, description="Preferred response language")
-    languages: List[str] = []
+    languages: List[str] = Field(default_factory=list)
 
 
 class TTSResponse(BaseModel):
@@ -75,7 +83,7 @@ class TTSResponse(BaseModel):
 class OrchestratorEvent(BaseModel):
     """Streaming event from the orchestrator."""
 
-    type: str  # "delta", "final", "error", "language_info"
+    type: str
     text: Optional[str] = None
     language: Optional[str] = None
     languages: Optional[List[str]] = None

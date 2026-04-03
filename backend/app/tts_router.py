@@ -1,5 +1,9 @@
+from __future__ import annotations
+
 import asyncio
+import audioop
 import base64
+import importlib.util
 import io
 import math
 import os
@@ -9,7 +13,8 @@ import struct
 import subprocess
 import tempfile
 import wave
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from .config import settings
@@ -17,6 +22,8 @@ from .logger import get_logger
 from .response_policy import choose_response_language
 
 log = get_logger("tts")
+
+SUPPORTED_TTS_LANGUAGES = ("en", "hi", "kn")
 
 
 @dataclass
@@ -71,14 +78,40 @@ class TTSSegmentInput:
     languages: Optional[list[str]] = None
 
 
+@dataclass
+class TTSProviderDiagnostic:
+    name: str
+    priority: int
+    available: bool
+    supported_languages: list[str]
+    configured_languages: list[str]
+    issues: list[str] = field(default_factory=list)
+    details: dict[str, str] = field(default_factory=dict)
+
+
 class BaseTTSProvider:
     name = "base"
 
     def is_available(self) -> bool:
         return False
 
+    def supported_languages(self) -> list[str]:
+        return list(SUPPORTED_TTS_LANGUAGES)
+
+    def configured_languages(self) -> list[str]:
+        return []
+
     def supports_language(self, language: str) -> bool:
-        return True
+        return language in self.configured_languages()
+
+    def diagnostics(self, priority: int) -> TTSProviderDiagnostic:
+        return TTSProviderDiagnostic(
+            name=self.name,
+            priority=priority,
+            available=self.is_available(),
+            supported_languages=self.supported_languages(),
+            configured_languages=self.configured_languages(),
+        )
 
     def synthesize(self, text: str, language: str) -> TTSResult:
         raise NotImplementedError
@@ -90,34 +123,53 @@ class IndicTTSProvider(BaseTTSProvider):
     def __init__(self):
         self._command_template = settings.indic_tts_command_template.strip()
 
+    def supported_languages(self) -> list[str]:
+        return ["hi", "kn"]
+
+    def configured_languages(self) -> list[str]:
+        languages: list[str] = []
+        for language in self.supported_languages():
+            if not self._language_issues(language):
+                languages.append(language)
+        return languages
+
     def is_available(self) -> bool:
-        return bool(
-            self._command_template
-            and (
-                _voice_path_for_language("indic", "hi")
-                or _voice_path_for_language("indic", "kn")
-            )
-        )
+        return bool(self.configured_languages())
 
     def supports_language(self, language: str) -> bool:
-        return language in {"hi", "kn"}
+        return language in self.configured_languages()
+
+    def diagnostics(self, priority: int) -> TTSProviderDiagnostic:
+        issues: list[str] = []
+        for language in self.supported_languages():
+            issues.extend(self._language_issues(language))
+
+        return TTSProviderDiagnostic(
+            name=self.name,
+            priority=priority,
+            available=self.is_available(),
+            supported_languages=self.supported_languages(),
+            configured_languages=self.configured_languages(),
+            issues=issues,
+            details={
+                "python_bin": settings.indic_tts_python_bin or "python",
+                "command_template": self._command_template or "<default>",
+            },
+        )
 
     def synthesize(self, text: str, language: str) -> TTSResult:
-        if not self._command_template:
-            raise RuntimeError("AI4Bharat Indic-TTS command template is not configured.")
-
-        voice_path = _voice_path_for_language("indic", language)
-        if not voice_path:
-            raise RuntimeError(f"No AI4Bharat Indic-TTS voice configured for language '{language}'.")
+        if not self.supports_language(language):
+            raise RuntimeError(
+                f"AI4Bharat Indic-TTS assets are not fully configured for language '{language}'."
+            )
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as output_file:
             output_path = output_file.name
 
         try:
-            command = self._build_command(language, voice_path, output_path)
+            command = self._build_command(text, language, output_path)
             proc = subprocess.run(
                 command,
-                input=text.encode("utf-8"),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
@@ -128,27 +180,71 @@ class IndicTTSProvider(BaseTTSProvider):
                     or "AI4Bharat Indic-TTS synthesis failed."
                 )
 
-            with open(output_path, "rb") as f:
-                audio_bytes = f.read()
+            with open(output_path, "rb") as handle:
+                audio_bytes = handle.read()
 
             return TTSResult(
                 text=text,
                 language=language,
                 provider=self.name,
                 audio_bytes=audio_bytes,
-                sample_rate=settings.tts_sample_rate,
+                sample_rate=_wav_sample_rate(audio_bytes) or settings.tts_sample_rate,
             )
         finally:
             if os.path.exists(output_path):
                 os.remove(output_path)
 
-    def _build_command(self, language: str, voice_path: str, output_path: str) -> list[str]:
-        rendered = self._command_template.format(
-            language=language,
-            voice=voice_path,
-            output_path=output_path,
-        )
-        return shlex.split(rendered, posix=False)
+    def _build_command(self, text: str, language: str, output_path: str) -> list[str]:
+        assets = _indic_tts_assets(language)
+        if self._command_template:
+            rendered = self._command_template.format(
+                language=language,
+                model_path=assets["model_path"],
+                config_path=assets["config_path"],
+                vocoder_path=assets["vocoder_path"],
+                vocoder_config_path=assets["vocoder_config_path"],
+                output_path=output_path,
+            )
+            return shlex.split(rendered, posix=False)
+
+        return [
+            settings.indic_tts_python_bin or "python",
+            "-m",
+            "TTS.bin.synthesize",
+            "--text",
+            text,
+            "--model_path",
+            assets["model_path"],
+            "--config_path",
+            assets["config_path"],
+            "--vocoder_path",
+            assets["vocoder_path"],
+            "--vocoder_config_path",
+            assets["vocoder_config_path"],
+            "--out_path",
+            output_path,
+        ]
+
+    def _language_issues(self, language: str) -> list[str]:
+        asset_map = _indic_tts_asset_map(language)
+        assets = {asset_key: value for asset_key, (_, value) in asset_map.items()}
+        missing_keys = [env_name for _, (env_name, value) in asset_map.items() if not value]
+        missing_paths = [
+            str(Path(value))
+            for value in assets.values()
+            if value and not Path(value).expanduser().exists()
+        ]
+
+        issues: list[str] = []
+        if missing_keys:
+            issues.append(
+                f"{language}: missing env values for {', '.join(sorted(missing_keys))}"
+            )
+        if missing_paths:
+            issues.append(
+                f"{language}: missing asset files at {', '.join(missing_paths)}"
+            )
+        return issues
 
 
 class PiperTTSProvider(BaseTTSProvider):
@@ -157,11 +253,43 @@ class PiperTTSProvider(BaseTTSProvider):
     def __init__(self):
         self._binary = settings.piper_binary or shutil.which("piper")
 
+    def configured_languages(self) -> list[str]:
+        languages: list[str] = []
+        for language in SUPPORTED_TTS_LANGUAGES:
+            voice_path = _voice_path_for_language("piper", language)
+            if voice_path and Path(voice_path).expanduser().exists():
+                languages.append(language)
+        return languages
+
     def is_available(self) -> bool:
-        return bool(self._binary and any(_voice_path_for_language("piper", lang) for lang in ("en", "hi", "kn")))
+        return bool(self._binary and self.configured_languages())
 
     def supports_language(self, language: str) -> bool:
-        return _voice_path_for_language("piper", language) is not None
+        return bool(
+            self._binary
+            and language in self.configured_languages()
+            and _voice_path_for_language("piper", language)
+        )
+
+    def diagnostics(self, priority: int) -> TTSProviderDiagnostic:
+        issues: list[str] = []
+        if not self._binary:
+            issues.append("Piper binary is not configured and was not found on PATH.")
+
+        for language in SUPPORTED_TTS_LANGUAGES:
+            voice_path = _voice_path_for_language("piper", language)
+            if voice_path and not Path(voice_path).expanduser().exists():
+                issues.append(f"{language}: Piper voice file does not exist at {voice_path}")
+
+        return TTSProviderDiagnostic(
+            name=self.name,
+            priority=priority,
+            available=self.is_available(),
+            supported_languages=list(SUPPORTED_TTS_LANGUAGES),
+            configured_languages=self.configured_languages(),
+            issues=issues,
+            details={"binary": self._binary or "<missing>"},
+        )
 
     def synthesize(self, text: str, language: str) -> TTSResult:
         if not self._binary:
@@ -170,6 +298,8 @@ class PiperTTSProvider(BaseTTSProvider):
         voice_path = _voice_path_for_language("piper", language)
         if not voice_path:
             raise RuntimeError(f"No Piper voice configured for language '{language}'.")
+        if not Path(voice_path).expanduser().exists():
+            raise RuntimeError(f"Piper voice file does not exist: {voice_path}")
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as output_file:
             output_path = output_file.name
@@ -183,17 +313,20 @@ class PiperTTSProvider(BaseTTSProvider):
                 check=False,
             )
             if proc.returncode != 0:
-                raise RuntimeError(proc.stderr.decode("utf-8", errors="ignore").strip() or "Piper synthesis failed.")
+                raise RuntimeError(
+                    proc.stderr.decode("utf-8", errors="ignore").strip()
+                    or "Piper synthesis failed."
+                )
 
-            with open(output_path, "rb") as f:
-                audio_bytes = f.read()
+            with open(output_path, "rb") as handle:
+                audio_bytes = handle.read()
 
             return TTSResult(
                 text=text,
                 language=language,
                 provider=self.name,
                 audio_bytes=audio_bytes,
-                sample_rate=settings.tts_sample_rate,
+                sample_rate=_wav_sample_rate(audio_bytes) or settings.tts_sample_rate,
             )
         finally:
             if os.path.exists(output_path):
@@ -206,6 +339,35 @@ class CoquiTTSProvider(BaseTTSProvider):
     def __init__(self):
         self._tts_models: dict[str, object] = {}
 
+    def configured_languages(self) -> list[str]:
+        languages: list[str] = []
+        for language in SUPPORTED_TTS_LANGUAGES:
+            if _voice_path_for_language("coqui", language):
+                languages.append(language)
+        return languages
+
+    def is_available(self) -> bool:
+        return _coqui_package_available() and bool(self.configured_languages())
+
+    def supports_language(self, language: str) -> bool:
+        return _coqui_package_available() and language in self.configured_languages()
+
+    def diagnostics(self, priority: int) -> TTSProviderDiagnostic:
+        issues: list[str] = []
+        if self.configured_languages() and not _coqui_package_available():
+            issues.append("Coqui model names are configured, but the TTS package is not installed.")
+        if not self.configured_languages():
+            issues.append("No Coqui models are configured.")
+
+        return TTSProviderDiagnostic(
+            name=self.name,
+            priority=priority,
+            available=self.is_available(),
+            supported_languages=list(SUPPORTED_TTS_LANGUAGES),
+            configured_languages=self.configured_languages(),
+            issues=issues,
+        )
+
     def _load(self, language: str):
         model_name = _voice_path_for_language("coqui", language)
         if not model_name:
@@ -216,24 +378,11 @@ class CoquiTTSProvider(BaseTTSProvider):
 
         try:
             from TTS.api import TTS  # type: ignore
-        except Exception as exc:  # pragma: no cover - optional dependency
+        except Exception as exc:
             raise RuntimeError(f"Coqui TTS is not installed: {exc}") from exc
 
         self._tts_models[model_name] = TTS(model_name=model_name)
         return self._tts_models[model_name]
-
-    def is_available(self) -> bool:
-        try:
-            for language in ("en", "hi", "kn"):
-                if _voice_path_for_language("coqui", language):
-                    self._load(language)
-                    return True
-            return False
-        except Exception:
-            return False
-
-    def supports_language(self, language: str) -> bool:
-        return _voice_path_for_language("coqui", language) is not None
 
     def synthesize(self, text: str, language: str) -> TTSResult:
         tts = self._load(language)
@@ -248,15 +397,15 @@ class CoquiTTSProvider(BaseTTSProvider):
                 kwargs["speaker"] = speaker
 
             tts.tts_to_file(text=text, file_path=output_path, **kwargs)
-            with open(output_path, "rb") as f:
-                audio_bytes = f.read()
+            with open(output_path, "rb") as handle:
+                audio_bytes = handle.read()
 
             return TTSResult(
                 text=text,
                 language=language,
                 provider=self.name,
                 audio_bytes=audio_bytes,
-                sample_rate=settings.tts_sample_rate,
+                sample_rate=_wav_sample_rate(audio_bytes) or settings.tts_sample_rate,
             )
         finally:
             if os.path.exists(output_path):
@@ -266,8 +415,30 @@ class CoquiTTSProvider(BaseTTSProvider):
 class ToneFallbackProvider(BaseTTSProvider):
     name = "tone-fallback"
 
+    def configured_languages(self) -> list[str]:
+        if settings.enable_tts_fallback_tone:
+            return list(SUPPORTED_TTS_LANGUAGES)
+        return []
+
     def is_available(self) -> bool:
         return settings.enable_tts_fallback_tone
+
+    def supports_language(self, language: str) -> bool:
+        return self.is_available() and language in SUPPORTED_TTS_LANGUAGES
+
+    def diagnostics(self, priority: int) -> TTSProviderDiagnostic:
+        issues = []
+        if not settings.enable_tts_fallback_tone:
+            issues.append("Tone fallback is disabled.")
+
+        return TTSProviderDiagnostic(
+            name=self.name,
+            priority=priority,
+            available=self.is_available(),
+            supported_languages=list(SUPPORTED_TTS_LANGUAGES),
+            configured_languages=self.configured_languages(),
+            issues=issues,
+        )
 
     def synthesize(self, text: str, language: str) -> TTSResult:
         duration_seconds = max(0.35, min(2.5, 0.055 * max(len(text.split()), 1)))
@@ -283,8 +454,8 @@ class ToneFallbackProvider(BaseTTSProvider):
 
             total_samples = int(duration_seconds * sample_rate)
             frames = bytearray()
-            for i in range(total_samples):
-                sample = amplitude * math.sin(2.0 * math.pi * tone_hz * (i / sample_rate))
+            for index in range(total_samples):
+                sample = amplitude * math.sin(2.0 * math.pi * tone_hz * (index / sample_rate))
                 frames.extend(struct.pack("<h", int(sample * 32767)))
             wav_file.writeframes(bytes(frames))
 
@@ -297,13 +468,41 @@ class ToneFallbackProvider(BaseTTSProvider):
         )
 
 
-def _voice_path_for_language(provider: str, language: str) -> Optional[str]:
-    if provider == "indic":
-        mapping = {
-            "hi": settings.indic_tts_voice_hi,
-            "kn": settings.indic_tts_voice_kn,
+def _coqui_package_available() -> bool:
+    return importlib.util.find_spec("TTS") is not None
+
+
+def _indic_tts_assets(language: str) -> dict[str, str]:
+    asset_map = _indic_tts_asset_map(language)
+    return {asset_key: value for asset_key, (_, value) in asset_map.items()}
+
+
+def _indic_tts_asset_map(language: str) -> dict[str, tuple[str, str]]:
+    if language == "hi":
+        return {
+            "model_path": ("INDIC_TTS_MODEL_HI", settings.indic_tts_model_hi),
+            "config_path": ("INDIC_TTS_CONFIG_HI", settings.indic_tts_config_hi),
+            "vocoder_path": ("INDIC_TTS_VOCODER_HI", settings.indic_tts_vocoder_hi),
+            "vocoder_config_path": (
+                "INDIC_TTS_VOCODER_CONFIG_HI",
+                settings.indic_tts_vocoder_config_hi,
+            ),
         }
-    elif provider == "piper":
+    if language == "kn":
+        return {
+            "model_path": ("INDIC_TTS_MODEL_KN", settings.indic_tts_model_kn),
+            "config_path": ("INDIC_TTS_CONFIG_KN", settings.indic_tts_config_kn),
+            "vocoder_path": ("INDIC_TTS_VOCODER_KN", settings.indic_tts_vocoder_kn),
+            "vocoder_config_path": (
+                "INDIC_TTS_VOCODER_CONFIG_KN",
+                settings.indic_tts_vocoder_config_kn,
+            ),
+        }
+    return {}
+
+
+def _voice_path_for_language(provider: str, language: str) -> Optional[str]:
+    if provider == "piper":
         mapping = {
             "en": settings.piper_voice_en,
             "hi": settings.piper_voice_hi,
@@ -334,7 +533,37 @@ class TTSRouter:
     def available_providers(self) -> list[str]:
         return [provider.name for provider in self.providers if provider.is_available()]
 
-    def choose_language(self, text: str, languages: Optional[list[str]] = None, preferred_language: Optional[str] = None) -> str:
+    def available_real_speech_providers(self) -> list[str]:
+        return [
+            provider.name
+            for provider in self.providers
+            if provider.is_available() and provider.name != "tone-fallback"
+        ]
+
+    def provider_diagnostics(self) -> list[dict]:
+        diagnostics = []
+        for priority, provider in enumerate(self.providers, start=1):
+            diagnostics.append(asdict(provider.diagnostics(priority)))
+        return diagnostics
+
+    def readiness_warnings(self) -> list[str]:
+        warnings: list[str] = []
+
+        if settings.enable_tts and not self.available_providers():
+            warnings.append("TTS is enabled, but no provider is currently available.")
+
+        for diagnostic in self.provider_diagnostics():
+            for issue in diagnostic["issues"]:
+                warnings.append(f"{diagnostic['name']}: {issue}")
+
+        return warnings
+
+    def choose_language(
+        self,
+        text: str,
+        languages: Optional[list[str]] = None,
+        preferred_language: Optional[str] = None,
+    ) -> str:
         return choose_response_language(text, languages, preferred_language)
 
     async def synthesize(
@@ -389,7 +618,6 @@ class TTSRouter:
                 languages=segment.languages or languages,
                 preferred_language=segment.language or preferred_language,
             )
-            duration_ms = _wav_duration_ms(result.audio_bytes)
             results.append(
                 TTSSegmentResult(
                     index=index,
@@ -399,12 +627,15 @@ class TTSRouter:
                     audio_bytes=result.audio_bytes,
                     mime_type=result.mime_type,
                     sample_rate=result.sample_rate,
-                    duration_ms=duration_ms,
+                    duration_ms=_wav_duration_ms(result.audio_bytes),
                 )
             )
             merged_provider_names.append(result.provider)
 
-        merged_audio = _merge_wav_segments([result.audio_bytes for result in results])
+        merged_audio = _merge_wav_segments(
+            [result.audio_bytes for result in results],
+            target_sample_rate=settings.tts_sample_rate,
+        )
         language = self.choose_language(
             " ".join(segment.text.strip() for segment in cleaned_segments),
             languages,
@@ -418,11 +649,19 @@ class TTSRouter:
             provider=provider,
             audio_bytes=merged_audio,
             segments=results,
-            sample_rate=results[0].sample_rate if results else settings.tts_sample_rate,
+            sample_rate=settings.tts_sample_rate,
         )
 
 
 tts_router = TTSRouter()
+
+
+def _wav_sample_rate(audio_bytes: bytes) -> Optional[int]:
+    try:
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
+            return wav_file.getframerate()
+    except Exception:
+        return None
 
 
 def _wav_duration_ms(audio_bytes: bytes) -> Optional[int]:
@@ -437,40 +676,75 @@ def _wav_duration_ms(audio_bytes: bytes) -> Optional[int]:
         return None
 
 
-def _merge_wav_segments(segments: list[bytes]) -> bytes:
+def _normalize_wav_frames(
+    audio_bytes: bytes,
+    target_sample_rate: int,
+    target_channels: int = 1,
+    target_sample_width: int = 2,
+) -> tuple[bytes, int, int, int]:
+    with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
+        sample_rate = wav_file.getframerate()
+        channels = wav_file.getnchannels()
+        sample_width = wav_file.getsampwidth()
+        frames = wav_file.readframes(wav_file.getnframes())
+
+    if channels not in {1, 2}:
+        raise ValueError(f"Unsupported WAV channel count: {channels}")
+
+    if sample_width != target_sample_width:
+        frames = audioop.lin2lin(frames, sample_width, target_sample_width)
+        sample_width = target_sample_width
+
+    if channels != target_channels:
+        if channels == 2 and target_channels == 1:
+            frames = audioop.tomono(frames, sample_width, 0.5, 0.5)
+        elif channels == 1 and target_channels == 2:
+            frames = audioop.tostereo(frames, sample_width, 1.0, 1.0)
+        else:
+            raise ValueError(
+                f"Unsupported channel conversion from {channels} to {target_channels}"
+            )
+        channels = target_channels
+
+    if sample_rate != target_sample_rate:
+        frames, _ = audioop.ratecv(
+            frames,
+            sample_width,
+            channels,
+            sample_rate,
+            target_sample_rate,
+            None,
+        )
+        sample_rate = target_sample_rate
+
+    return frames, sample_rate, channels, sample_width
+
+
+def _merge_wav_segments(segments: list[bytes], target_sample_rate: Optional[int] = None) -> bytes:
     if not segments:
         raise ValueError("No audio segments to merge.")
 
+    output_sample_rate = target_sample_rate or settings.tts_sample_rate
     merged_frames = bytearray()
-    sample_rate = None
-    channels = None
-    sample_width = None
+    channels = 1
+    sample_width = 2
 
     for audio_bytes in segments:
-        with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
-            current_sample_rate = wav_file.getframerate()
-            current_channels = wav_file.getnchannels()
-            current_sample_width = wav_file.getsampwidth()
-
-            if sample_rate is None:
-                sample_rate = current_sample_rate
-                channels = current_channels
-                sample_width = current_sample_width
-            elif (
-                current_sample_rate != sample_rate
-                or current_channels != channels
-                or current_sample_width != sample_width
-            ):
-                raise ValueError("Cannot merge WAV segments with mismatched audio formats.")
-
-            merged_frames.extend(wav_file.readframes(wav_file.getnframes()))
+        frames, _, normalized_channels, normalized_sample_width = _normalize_wav_frames(
+            audio_bytes,
+            target_sample_rate=output_sample_rate,
+            target_channels=channels,
+            target_sample_width=sample_width,
+        )
+        channels = normalized_channels
+        sample_width = normalized_sample_width
+        merged_frames.extend(frames)
 
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as wav_file:
-        wav_file.setnchannels(channels or 1)
-        wav_file.setsampwidth(sample_width or 2)
-        wav_file.setframerate(sample_rate or settings.tts_sample_rate)
+        wav_file.setnchannels(channels)
+        wav_file.setsampwidth(sample_width)
+        wav_file.setframerate(output_sample_rate)
         wav_file.writeframes(bytes(merged_frames))
 
     return buffer.getvalue()
-

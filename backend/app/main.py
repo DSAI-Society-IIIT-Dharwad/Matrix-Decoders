@@ -2,19 +2,20 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .api import router
-from .config import settings
+from .config import existing_env_files, settings
 from .logger import get_logger
+from .runtime_validation import collect_runtime_validation_report
 from .tts_router import tts_router
 
 log = get_logger("main")
 
 app = FastAPI(
-    title="NuDiscribe — Multilingual Speech Orchestrator",
+    title="NuDiscribe - Multilingual Speech Orchestrator",
     description=(
         "Code-mixed speech recognition and conversational AI "
         "for Hindi, English, and Kannada."
     ),
-    version="2.0.0",
+    version="2.1.0",
 )
 
 app.add_middleware(
@@ -37,13 +38,22 @@ async def startup_event():
     log.info(f"Max context: {settings.max_context_messages} messages")
     log.info(f"TTS enabled: {'yes' if settings.enable_tts else 'no'}")
     log.info(f"TTS providers: {tts_router.available_providers()}")
+    log.info(f"TTS real providers: {tts_router.available_real_speech_providers()}")
+    log.info(f"Env files: {[str(path) for path in existing_env_files()]}")
+
+    validation_report = collect_runtime_validation_report(run_command_probes=False)
+    for issue in validation_report.issues:
+        if issue.level == "error":
+            log.error(issue.message)
+        else:
+            log.warning(issue.message)
 
 
 @app.get("/")
 async def root():
     return {
         "service": "NuDiscribe",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "status": "ok",
         "model": settings.ollama_model,
         "features": [
@@ -54,5 +64,6 @@ async def root():
             "websocket-audio",
             "tts-routing",
             "websocket-tts",
+            "runtime-validation",
         ],
     }

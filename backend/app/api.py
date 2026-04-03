@@ -11,6 +11,7 @@ from .logger import get_logger
 from .memory import store
 from .orchestrator import Orchestrator
 from .audio_utils import AudioFormatConfig, trim_pcm16_silence
+from .runtime_validation import collect_runtime_validation_report
 from .schemas import ChatRequest, ChatResponse, HealthResponse, TTSRequest, TTSResponse
 from .transcript_cleaner import clean_transcript
 from .tts_router import TTSSegmentInput, tts_router
@@ -74,12 +75,27 @@ async def health_check():
 
     client = OllamaClient()
     ollama_ok = await client.is_available()
+    validation_report = collect_runtime_validation_report(run_command_probes=False)
+    tts_ready = bool(tts_router.available_providers())
+    tts_real_ready = bool(tts_router.available_real_speech_providers())
+    health_status = "ok"
+    if not ollama_ok or (
+        bool(validation_report.settings_summary["enable_tts"]) and not tts_real_ready
+    ):
+        health_status = "degraded"
 
     return HealthResponse(
-        status="ok" if ollama_ok else "degraded",
+        status=health_status,
         model=client.model,
         uptime_seconds=round(time.time() - _start_time, 1),
         sessions_active=store.session_count(),
+        tts_enabled=bool(validation_report.settings_summary["enable_tts"]),
+        tts_ready=tts_ready,
+        tts_providers=tts_router.available_providers(),
+        tts_real_speech_ready=tts_real_ready,
+        tts_real_providers=tts_router.available_real_speech_providers(),
+        errors=[issue.message for issue in validation_report.issues if issue.level == "error"],
+        warnings=[issue.message for issue in validation_report.issues if issue.level != "error"],
     )
 
 

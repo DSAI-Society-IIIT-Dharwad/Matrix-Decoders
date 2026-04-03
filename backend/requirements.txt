@@ -14,3 +14,9 @@ openai-whisper
 torch
 torchaudio
 transformers
+
+# TTS
+TTS
+
+# Test / local clients
+sounddevice

@@ -37,6 +37,7 @@ Core modules in the current implementation:
 - `backend/app/ollama_client.py`: Ollama streaming client
 - `backend/app/memory.py`: in-memory session tracking
 - `backend/app/prompt.py`: language-aware prompting strategy
+- `backend/app/tts_router.py`: AI4Bharat-first TTS routing with fallback providers
 
 ## Implemented Features
 
@@ -76,7 +77,7 @@ What is not yet complete:
 - no automated test suite is present
 - no containerization or deployment configuration is included
 - no production observability stack exists
-- text-to-speech is not yet implemented, only a sentence-level `tts_plan`
+- text-to-speech is implemented end to end at the backend layer, with runtime validation and provider diagnostics included; deployment still requires local model/runtime setup
 - multilingual quality is heuristic-driven and still needs evaluation against real usage data
 
 In practical terms, this repository should be viewed as a functional backend prototype, not a production-ready application.
@@ -154,6 +155,14 @@ The backend uses environment variables for configuration. Typical values include
 - `OLLAMA_BASE_URL`
 - `OLLAMA_MODEL`
 - `OLLAMA_TIMEOUT`
+- `INDIC_TTS_MODEL_HI`
+- `INDIC_TTS_CONFIG_HI`
+- `INDIC_TTS_VOCODER_HI`
+- `INDIC_TTS_VOCODER_CONFIG_HI`
+- `INDIC_TTS_MODEL_KN`
+- `INDIC_TTS_CONFIG_KN`
+- `INDIC_TTS_VOCODER_KN`
+- `INDIC_TTS_VOCODER_CONFIG_KN`
 
 Example values currently used during development:
 
@@ -163,12 +172,22 @@ OLLAMA_MODEL=mistral
 OLLAMA_TIMEOUT=120
 ```
 
+Copy `.env.example` to repo-root `.env` or `backend/.env` and fill in the TTS paths if you want Hindi/Kannada synthesis through AI4Bharat Indic-TTS.
+
 ### Install Dependencies
 
 ```bash
 cd backend
 pip install -r requirements.txt
 ```
+
+For AI4Bharat Indic-TTS, install the runtime and point the `.env` values at the downloaded model/config/vocoder files for Hindi and Kannada. The backend will invoke:
+
+```bash
+python -m TTS.bin.synthesize --text "..." --model_path ... --config_path ... --vocoder_path ... --vocoder_config_path ... --out_path ...
+```
+
+You can override that exact command shape with `INDIC_TTS_COMMAND_TEMPLATE` if your local runtime layout differs.
 
 ### Run the Server
 
@@ -180,6 +199,40 @@ The default local server endpoint is typically:
 
 ```text
 http://127.0.0.1:8000
+```
+
+### Validate The Current Product
+
+From the `backend/` directory, use the product smoke test to validate the current backend before moving to the next phase.
+
+Static runtime validation only:
+
+```bash
+python app/product_smoke_test.py --self-check
+```
+
+Static validation plus interpreter probe for the configured Indic-TTS python binary:
+
+```bash
+python app/product_smoke_test.py --self-check --run-command-probes
+```
+
+Full backend smoke test against a running server:
+
+```bash
+python app/product_smoke_test.py --base-url http://127.0.0.1:8000
+```
+
+If you intentionally want to allow the synthetic tone fallback during local debugging:
+
+```bash
+python app/product_smoke_test.py --base-url http://127.0.0.1:8000 --allow-tone-fallback
+```
+
+Optional audio/transcription coverage:
+
+```bash
+python app/product_smoke_test.py --base-url http://127.0.0.1:8000 --audio-file /path/to/sample.wav
 ```
 
 ## API Summary
@@ -197,6 +250,7 @@ http://127.0.0.1:8000
 
 - `ws://localhost:8000/ws/{session_id}`
 - `ws://localhost:8000/ws/audio/{session_id}`
+- `ws://localhost:8000/ws/tts/{session_id}`
 
 ## Known Limitations
 
@@ -214,10 +268,9 @@ The next phase of development should focus on moving from prototype to reliable 
 
 ### Near-Term Priorities
 
-- add a proper `.env.example`
 - add a test suite for API, orchestration, and language detection logic
-- add a `README` setup verification flow
-- clean up encoding issues in source strings and comments
+- add automated smoke-test execution in CI or deployment verification
+- clean up remaining encoding issues in source strings and comments
 - add structured logging and stronger error reporting
 - refine the audio WebSocket protocol and client examples
 

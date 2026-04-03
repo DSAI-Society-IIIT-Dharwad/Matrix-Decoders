@@ -6,27 +6,29 @@ class ColorFormatter(logging.Formatter):
     """Color-coded log formatter for console output."""
 
     COLORS = {
-        logging.DEBUG: "\033[36m",     # Cyan
-        logging.INFO: "\033[32m",      # Green
-        logging.WARNING: "\033[33m",   # Yellow
-        logging.ERROR: "\033[31m",     # Red
-        logging.CRITICAL: "\033[35m",  # Magenta
+        logging.DEBUG: "\033[36m",
+        logging.INFO: "\033[32m",
+        logging.WARNING: "\033[33m",
+        logging.ERROR: "\033[31m",
+        logging.CRITICAL: "\033[35m",
     }
     RESET = "\033[0m"
 
-    ICONS = {
-        logging.DEBUG: "🔍",
-        logging.INFO: "✅",
-        logging.WARNING: "⚠️",
-        logging.ERROR: "❌",
-        logging.CRITICAL: "🔥",
+    LABELS = {
+        logging.DEBUG: "[DEBUG]",
+        logging.INFO: "[INFO]",
+        logging.WARNING: "[WARN]",
+        logging.ERROR: "[ERROR]",
+        logging.CRITICAL: "[CRITICAL]",
     }
 
     def format(self, record):
         color = self.COLORS.get(record.levelno, self.RESET)
-        icon = self.ICONS.get(record.levelno, "")
-        record.msg = f"{color}{icon} {record.msg}{self.RESET}"
-        return super().format(record)
+        label = self.LABELS.get(record.levelno, "")
+        record_copy = logging.makeLogRecord(record.__dict__.copy())
+        record_copy.msg = f"{color}{label} {record.getMessage()}{self.RESET}"
+        record_copy.args = ()
+        return super().format(record_copy)
 
 
 def get_logger(name: str) -> logging.Logger:

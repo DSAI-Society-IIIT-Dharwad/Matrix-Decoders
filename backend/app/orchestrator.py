@@ -1,9 +1,9 @@
-from .memory import store
-from .language import detect_scripts, is_code_mixed, get_dominant_language, split_sentences
-from .prompt import build_messages
-from .ollama_client import OllamaClient
 from .asr.router import ASRRouter
+from .language import detect_scripts, get_dominant_language, split_sentences
 from .logger import get_logger
+from .memory import store
+from .ollama_client import OllamaClient
+from .prompt import build_messages
 from .response_policy import choose_response_language
 from .transcript_cleaner import clean_transcript
 
@@ -14,22 +14,10 @@ asr = ASRRouter()
 
 
 class Orchestrator:
-    """Orchestrates the full pipeline: ASR → Language Detection → LLM → Response."""
+    """Orchestrates the full pipeline: ASR -> language detection -> LLM -> response."""
 
     async def process(self, session_id: str, text: str, languages: set = None):
-        """Process text input through the pipeline.
-
-        Yields streaming events:
-        - {"type": "language_info", ...}: Detected language information
-        - {"type": "delta", "text": ...}: Streaming LLM chunk
-        - {"type": "final", ...}: Complete response with TTS plan
-        - {"type": "error", ...}: Error information
-
-        Args:
-            session_id: Conversation session identifier.
-            text: User input text.
-            languages: Pre-detected languages (from ASR). Auto-detected if None.
-        """
+        """Process text input through the pipeline."""
         text = clean_transcript(text)
         if not text:
             yield {"type": "error", "error": "Empty input received."}
@@ -37,17 +25,14 @@ class Orchestrator:
 
         log.info(f"Processing text: '{text[:80]}...'")
 
-        # Detect languages if not provided
         if languages is None:
             languages = detect_scripts(text)
 
         dominant_lang = get_dominant_language(text, languages.copy())
         code_mixed = len(languages - {"unknown"}) > 1
 
-        # Track languages in session
         store.track_languages(session_id, languages)
 
-        # Emit language info event
         yield {
             "type": "language_info",
             "languages": list(languages),
@@ -55,19 +40,14 @@ class Orchestrator:
             "is_code_mixed": code_mixed,
         }
 
-        # Get conversation history
         history = store.get(session_id)
-
-        # Build prompt with language context
         messages = build_messages(history, text, languages)
 
         response_text = ""
         log.info("Sending to LLM...")
 
-        # Stream LLM response
         try:
             async for chunk in ollama.stream(messages):
-                # Check for error response from Ollama client
                 if chunk.startswith("[ERROR]"):
                     log.error(f"LLM error: {chunk}")
                     yield {"type": "error", "error": chunk}
@@ -76,20 +56,18 @@ class Orchestrator:
                 response_text += chunk
                 yield {"type": "delta", "text": chunk}
 
-        except Exception as e:
-            error_msg = f"LLM streaming failed: {e}"
+        except Exception as exc:
+            error_msg = f"LLM streaming failed: {exc}"
             log.error(error_msg)
             yield {"type": "error", "error": error_msg}
             return
 
+        response_text = clean_transcript(response_text)
         log.info(f"LLM response complete ({len(response_text)} chars)")
 
-        # Save conversation to memory
         store.add(session_id, "user", text)
         store.add(session_id, "assistant", response_text)
 
-        # Prepare TTS chunks
-        response_text = clean_transcript(response_text)
         sentences = split_sentences(response_text)
         tts_language = choose_response_language(response_text, languages)
         tts_segments = []
@@ -122,15 +100,10 @@ class Orchestrator:
         }
 
     async def process_audio(self, session_id: str, audio_path: str):
-        """Process audio through ASR → LLM pipeline.
-
-        Runs the full code-mixed ASR pipeline, then passes the
-        transcription to the text processing pipeline.
-        """
+        """Process audio through the ASR -> LLM pipeline."""
         log.info("Starting audio pipeline...")
 
         try:
-            # Run full code-mixed ASR
             result = await asr.transcribe_full(audio_path)
 
             log.info(
@@ -146,7 +119,6 @@ class Orchestrator:
                 }
                 return
 
-            # Emit transcription event
             yield {
                 "type": "transcription",
                 "text": result.text,
@@ -156,11 +128,10 @@ class Orchestrator:
                 "segments": result.segments,
             }
 
-            # Pass to main text pipeline with pre-detected languages
             async for event in self.process(session_id, result.text, result.languages):
                 yield event
 
-        except Exception as e:
-            error_msg = f"Audio processing failed: {e}"
+        except Exception as exc:
+            error_msg = f"Audio processing failed: {exc}"
             log.error(error_msg)
             yield {"type": "error", "error": error_msg}
