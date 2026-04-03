@@ -55,14 +55,15 @@ def _print_report(report: dict[str, object]) -> None:
     print(f"Settings: {report['settings_summary']}")
     print(f"Required packages: {report['required_packages']}")
     print(f"Optional packages: {report['optional_packages']}")
-    print("TTS providers:")
-    for provider in report["tts_providers"]:
-        print(
-            "  "
-            f"- {provider['name']} | available={provider['available']} "
-            f"| configured={provider['configured_languages']} "
-            f"| issues={provider['issues']}"
-        )
+    if report["settings_summary"].get("enable_tts"):
+        print("TTS providers:")
+        for provider in report["tts_providers"]:
+            print(
+                "  "
+                f"- {provider['name']} | available={provider['available']} "
+                f"| configured={provider['configured_languages']} "
+                f"| issues={provider['issues']}"
+            )
     print("Issues:")
     for issue in report["issues"]:
         print(f"  - {issue['level']}: {issue['message']}")

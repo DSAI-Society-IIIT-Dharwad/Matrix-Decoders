@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .api import router
 from .config import existing_env_files, settings
 from .logger import get_logger
+from .memory import store
 from .runtime_validation import collect_runtime_validation_report
 from .tts_router import tts_router
 
@@ -34,6 +35,7 @@ async def startup_event():
     log.info("Server started")
     log.info(f"Model: {settings.ollama_model}")
     log.info(f"Ollama URL: {settings.ollama_base_url}")
+    log.info(f"Persistence DB: {store.db_path}")
     log.info(f"Indic ASR: {'enabled' if settings.enable_indic_asr else 'disabled'}")
     log.info(f"Max context: {settings.max_context_messages} messages")
     log.info(f"TTS enabled: {'yes' if settings.enable_tts else 'no'}")
@@ -47,6 +49,11 @@ async def startup_event():
             log.error(issue.message)
         else:
             log.warning(issue.message)
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    store.close()
 
 
 @app.get("/")

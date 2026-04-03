@@ -123,35 +123,36 @@ def collect_runtime_validation_report(run_command_probes: bool = False) -> Runti
                 )
             )
 
-    if settings.enable_tts and not tts_router.available_providers():
-        report.issues.append(
-            ValidationIssue(
-                level="error",
-                message="TTS is enabled but no provider is currently available.",
-            )
-        )
-
-    if settings.enable_tts and not tts_router.available_real_speech_providers():
-        report.issues.append(
-            ValidationIssue(
-                level="error",
-                message=(
-                    "No real speech TTS provider is available. "
-                    "Only tone fallback may be usable until AI4Bharat, Piper, or Coqui is configured."
-                ),
-            )
-        )
-
-    for diagnostic in report.tts_providers:
-        for issue in diagnostic.get("issues", []):
+    if settings.enable_tts:
+        if not tts_router.available_providers():
             report.issues.append(
                 ValidationIssue(
-                    level="warning",
-                    message=f"{diagnostic['name']}: {issue}",
+                    level="error",
+                    message="TTS is enabled but no provider is currently available.",
                 )
             )
 
-    if run_command_probes:
+        if not tts_router.available_real_speech_providers():
+            report.issues.append(
+                ValidationIssue(
+                    level="warning",
+                    message=(
+                        "No real speech TTS provider is available yet. "
+                        "Tone fallback will be used until AI4Bharat, Piper, or Coqui is configured."
+                    ),
+                )
+            )
+
+        for diagnostic in report.tts_providers:
+            for issue in diagnostic.get("issues", []):
+                report.issues.append(
+                    ValidationIssue(
+                        level="warning",
+                        message=f"{diagnostic['name']}: {issue}",
+                    )
+                )
+
+    if run_command_probes and settings.enable_tts:
         ok, message = _probe_python_module(settings.indic_tts_python_bin or "python", "TTS")
         if not ok:
             report.issues.append(

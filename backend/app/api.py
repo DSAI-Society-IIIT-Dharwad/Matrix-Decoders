@@ -7,10 +7,12 @@ from fastapi import APIRouter, File, UploadFile, WebSocket
 from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
+from .asr.router import ASRRouter
+from .audio_utils import AudioFormatConfig, trim_pcm16_silence
 from .logger import get_logger
 from .memory import store
+from .ollama_client import OllamaClient
 from .orchestrator import Orchestrator
-from .audio_utils import AudioFormatConfig, trim_pcm16_silence
 from .runtime_validation import collect_runtime_validation_report
 from .schemas import ChatRequest, ChatResponse, HealthResponse, TTSRequest, TTSResponse
 from .transcript_cleaner import clean_transcript
@@ -20,9 +22,15 @@ log = get_logger("api")
 
 router = APIRouter()
 orch = Orchestrator()
+asr_router = ASRRouter()
+ollama_client = OllamaClient()
 
 _start_time = time.time()
 _ALLOWED_AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg", ".webm", ".flac"}
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return int((time.perf_counter() - started_at) * 1000)
 
 
 def _build_tts_segment_inputs(
@@ -71,29 +79,28 @@ def _build_tts_segment_inputs(
 @router.get("/api/health", response_model=HealthResponse)
 async def health_check():
     """Health check with model status and uptime."""
-    from .ollama_client import OllamaClient
-
-    client = OllamaClient()
-    ollama_ok = await client.is_available()
+    ollama_ok = await ollama_client.is_available()
     validation_report = collect_runtime_validation_report(run_command_probes=False)
-    tts_ready = bool(tts_router.available_providers())
-    tts_real_ready = bool(tts_router.available_real_speech_providers())
+    available_tts_providers = tts_router.available_providers()
+    available_real_tts_providers = tts_router.available_real_speech_providers()
+    tts_ready = bool(available_tts_providers)
+    tts_real_ready = bool(available_real_tts_providers)
     health_status = "ok"
     if not ollama_ok or (
-        bool(validation_report.settings_summary["enable_tts"]) and not tts_real_ready
+        bool(validation_report.settings_summary["enable_tts"]) and not tts_ready
     ):
         health_status = "degraded"
 
     return HealthResponse(
         status=health_status,
-        model=client.model,
+        model=ollama_client.model,
         uptime_seconds=round(time.time() - _start_time, 1),
         sessions_active=store.session_count(),
         tts_enabled=bool(validation_report.settings_summary["enable_tts"]),
         tts_ready=tts_ready,
-        tts_providers=tts_router.available_providers(),
+        tts_providers=available_tts_providers,
         tts_real_speech_ready=tts_real_ready,
-        tts_real_providers=tts_router.available_real_speech_providers(),
+        tts_real_providers=available_real_tts_providers,
         errors=[issue.message for issue in validation_report.issues if issue.level == "error"],
         warnings=[issue.message for issue in validation_report.issues if issue.level != "error"],
     )
@@ -102,8 +109,12 @@ async def health_check():
 @router.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """Text chat endpoint with language-aware validation."""
+    started_at = time.perf_counter()
     cleaned_text = clean_transcript(request.text)
     if not cleaned_text:
+        message = "Text input cannot be empty."
+        store.record_error(request.session_id, "api.chat", message)
+        store.record_latency(request.session_id, "api.chat", _elapsed_ms(started_at), status="error")
         return JSONResponse(status_code=400, content={"error": "Text input cannot be empty."})
 
     log.info(f"Chat request [{request.session_id}]: '{cleaned_text[:60]}...'")
@@ -121,7 +132,27 @@ async def chat(request: ChatRequest):
             languages = event.get("languages", [])
             is_code_mixed = event.get("is_code_mixed", False)
         elif event["type"] == "error":
+            store.record_error(request.session_id, "api.chat", event["error"])
+            store.record_latency(
+                request.session_id,
+                "api.chat",
+                _elapsed_ms(started_at),
+                status="error",
+                details={"input_length": len(cleaned_text)},
+            )
             return JSONResponse(status_code=500, content={"error": event["error"]})
+
+    if languages:
+        store.track_languages(request.session_id, set(languages))
+    if language:
+        store.set_selected_language(request.session_id, language)
+    store.record_latency(
+        request.session_id,
+        "api.chat",
+        _elapsed_ms(started_at),
+        status="ok",
+        details={"response_language": language, "is_code_mixed": is_code_mixed},
+    )
 
     return ChatResponse(
         text=response_text,
@@ -136,13 +167,20 @@ async def chat(request: ChatRequest):
 async def transcribe_audio(file: UploadFile = File(...)):
     """Upload an audio file and return cleaned transcript metadata."""
     log.info(f"Transcribe request: {file.filename}")
+    started_at = time.perf_counter()
+    filename = file.filename or ""
 
-    suffix = os.path.splitext(file.filename or "")[1].lower()
+    suffix = os.path.splitext(filename)[1].lower()
     if suffix and suffix not in _ALLOWED_AUDIO_EXTENSIONS:
+        message = (
+            f"Unsupported audio format '{suffix}'. Expected one of {sorted(_ALLOWED_AUDIO_EXTENSIONS)}."
+        )
+        store.record_error(None, "api.transcribe", message, details={"filename": filename})
+        store.record_latency(None, "api.transcribe", _elapsed_ms(started_at), status="error")
         return JSONResponse(
             status_code=400,
             content={
-                "error": f"Unsupported audio format '{suffix}'. Expected one of {sorted(_ALLOWED_AUDIO_EXTENSIONS)}."
+                "error": message
             },
         )
 
@@ -153,15 +191,32 @@ async def transcribe_audio(file: UploadFile = File(...)):
     try:
         contents = await file.read()
         if not contents:
+            message = "Uploaded audio file is empty."
+            store.record_error(None, "api.transcribe", message, details={"filename": filename})
+            store.record_latency(None, "api.transcribe", _elapsed_ms(started_at), status="error")
             return JSONResponse(status_code=400, content={"error": "Uploaded audio file is empty."})
 
         with open(temp_path, "wb") as f:
             f.write(contents)
 
-        from .asr.router import ASRRouter
-
-        asr = ASRRouter()
-        result = await asr.transcribe_full(temp_path)
+        result = await asr_router.transcribe_full(temp_path)
+        store.record_transcript(
+            session_id=None,
+            source="api.transcribe",
+            text=result.text,
+            dominant_language=result.dominant_language,
+            languages=result.languages,
+            is_code_mixed=result.is_code_mixed,
+            segments=result.segments,
+            details={"filename": filename, "content_type": file.content_type or ""},
+        )
+        store.record_latency(
+            None,
+            "api.transcribe",
+            _elapsed_ms(started_at),
+            status="ok",
+            details={"filename": filename, "language": result.dominant_language},
+        )
 
         return {
             "text": result.text,
@@ -173,6 +228,8 @@ async def transcribe_audio(file: UploadFile = File(...)):
 
     except Exception as e:
         log.error(f"Transcription failed: {e}")
+        store.record_error(None, "api.transcribe", str(e), details={"filename": filename})
+        store.record_latency(None, "api.transcribe", _elapsed_ms(started_at), status="error")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
     finally:
@@ -183,8 +240,12 @@ async def transcribe_audio(file: UploadFile = File(...)):
 @router.post("/api/tts", response_model=TTSResponse)
 async def synthesize_speech(request: TTSRequest):
     """Synthesize speech for the provided text."""
+    started_at = time.perf_counter()
     cleaned_text = clean_transcript(request.text)
     if not cleaned_text:
+        message = "TTS input cannot be empty."
+        store.record_error(None, "api.tts", message)
+        store.record_latency(None, "api.tts", _elapsed_ms(started_at), status="error")
         return JSONResponse(status_code=400, content={"error": "TTS input cannot be empty."})
 
     try:
@@ -200,12 +261,30 @@ async def synthesize_speech(request: TTSRequest):
             preferred_language=request.language,
         )
     except ValueError as e:
+        store.record_error(None, "api.tts", str(e))
+        store.record_latency(None, "api.tts", _elapsed_ms(started_at), status="error")
         return JSONResponse(status_code=400, content={"error": str(e)})
     except RuntimeError as e:
+        store.record_error(None, "api.tts", str(e))
+        store.record_latency(None, "api.tts", _elapsed_ms(started_at), status="error")
         return JSONResponse(status_code=503, content={"error": str(e)})
     except Exception as e:
         log.error(f"TTS synthesis failed: {e}")
+        store.record_error(None, "api.tts", str(e))
+        store.record_latency(None, "api.tts", _elapsed_ms(started_at), status="error")
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+    store.record_latency(
+        None,
+        "api.tts",
+        _elapsed_ms(started_at),
+        status="ok",
+        details={
+            "language": result.language,
+            "provider": result.provider,
+            "segment_count": len(result.segments),
+        },
+    )
 
     return TTSResponse(
         text=result.text,
@@ -239,28 +318,64 @@ async def text_ws(ws: WebSocket, session_id: str):
     try:
         while True:
             raw = await ws.receive_text()
+            started_at = time.perf_counter()
 
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
+                store.record_error(session_id, "ws.text", "Invalid JSON")
+                store.record_latency(session_id, "ws.text", _elapsed_ms(started_at), status="error")
                 await ws.send_json({"type": "error", "error": "Invalid JSON"})
                 continue
 
             cleaned_text = clean_transcript(msg.get("text", ""))
             if msg.get("type") != "input" or not cleaned_text:
+                message = "Expected {type: 'input', text: '...'}"
+                store.record_error(session_id, "ws.text", message)
+                store.record_latency(session_id, "ws.text", _elapsed_ms(started_at), status="error")
                 await ws.send_json(
-                    {"type": "error", "error": "Expected {type: 'input', text: '...'}"}
+                    {"type": "error", "error": message}
                 )
                 continue
 
+            final_event = None
+            pipeline_error = None
             async for event in orch.process(session_id, cleaned_text):
                 if ws.client_state == WebSocketState.CONNECTED:
                     await ws.send_json(event)
+                if event["type"] == "final":
+                    final_event = event
+                elif event["type"] == "error":
+                    pipeline_error = event.get("error", "Unknown text WebSocket error")
+
+            latency_ms = _elapsed_ms(started_at)
+            if pipeline_error:
+                store.record_error(session_id, "ws.text", pipeline_error)
+                store.record_latency(session_id, "ws.text", latency_ms, status="error")
+                continue
+
+            if final_event:
+                final_languages = final_event.get("languages") or []
+                if final_languages:
+                    store.track_languages(session_id, set(final_languages))
+                if final_event.get("language"):
+                    store.set_selected_language(session_id, final_event["language"])
+                store.record_latency(
+                    session_id,
+                    "ws.text",
+                    latency_ms,
+                    status="ok",
+                    details={
+                        "response_language": final_event.get("language", ""),
+                        "is_code_mixed": bool(final_event.get("is_code_mixed", False)),
+                    },
+                )
 
     except WebSocketDisconnect:
         log.info(f"WebSocket disconnected: session={session_id}")
     except Exception as e:
         log.error(f"WebSocket error [{session_id}]: {e}")
+        store.record_error(session_id, "ws.text", str(e))
         try:
             if ws.client_state == WebSocketState.CONNECTED:
                 await ws.send_json({"type": "error", "error": str(e)})
@@ -278,6 +393,7 @@ async def audio_ws(ws: WebSocket, session_id: str):
     audio_buffer = bytearray()
     audio_config = AudioFormatConfig()
     last_audio_time = time.time()
+    commit_driven_mode = False
 
     silence_timeout = 1.2
 
@@ -299,6 +415,7 @@ async def audio_ws(ws: WebSocket, session_id: str):
             "Processing audio "
             f"({len(pcm_audio)} bytes, {audio_config.sample_rate}Hz, {audio_config.channels}ch)..."
         )
+        started_at = time.perf_counter()
 
         os.makedirs("temp_audio", exist_ok=True)
         temp_path = f"temp_audio/{session_id}_{int(time.time())}.wav"
@@ -310,12 +427,92 @@ async def audio_ws(ws: WebSocket, session_id: str):
                 wf.setframerate(audio_config.sample_rate)
                 wf.writeframes(pcm_audio)
 
+            transcription_event = None
+            final_event = None
+            pipeline_error = None
+
             async for event in orch.process_audio(session_id, temp_path):
+                if event["type"] == "transcription":
+                    transcription_event = event
+                elif event["type"] == "final":
+                    final_event = event
+                elif event["type"] == "error":
+                    pipeline_error = event.get("error", "Unknown audio pipeline error")
+
                 if ws.client_state == WebSocketState.CONNECTED:
                     await ws.send_json(event)
 
+            if transcription_event:
+                store.record_transcript(
+                    session_id=session_id,
+                    source="ws.audio",
+                    text=str(transcription_event.get("text", "")),
+                    dominant_language=transcription_event.get("language"),
+                    languages=transcription_event.get("languages") or [],
+                    is_code_mixed=bool(transcription_event.get("is_code_mixed", False)),
+                    segments=transcription_event.get("segments") or [],
+                    details={
+                        "sample_rate": audio_config.sample_rate,
+                        "channels": audio_config.channels,
+                    },
+                )
+
+            latency_ms = _elapsed_ms(started_at)
+            if pipeline_error:
+                store.record_error(
+                    session_id,
+                    "ws.audio",
+                    pipeline_error,
+                    details={
+                        "sample_rate": audio_config.sample_rate,
+                        "channels": audio_config.channels,
+                    },
+                )
+                store.record_latency(
+                    session_id,
+                    "ws.audio",
+                    latency_ms,
+                    status="error",
+                    details={
+                        "sample_rate": audio_config.sample_rate,
+                        "channels": audio_config.channels,
+                    },
+                )
+            elif final_event:
+                final_languages = final_event.get("languages") or []
+                if final_languages:
+                    store.track_languages(session_id, set(final_languages))
+                if final_event.get("language"):
+                    store.set_selected_language(session_id, final_event["language"])
+                store.record_latency(
+                    session_id,
+                    "ws.audio",
+                    latency_ms,
+                    status="ok",
+                    details={
+                        "sample_rate": audio_config.sample_rate,
+                        "channels": audio_config.channels,
+                        "transcript_language": (
+                            transcription_event.get("language", "") if transcription_event else ""
+                        ),
+                    },
+                )
+
         except Exception as e:
             log.error(f"Audio processing error: {e}")
+            store.record_error(
+                session_id,
+                "ws.audio",
+                str(e),
+                details={"sample_rate": audio_config.sample_rate, "channels": audio_config.channels},
+            )
+            store.record_latency(
+                session_id,
+                "ws.audio",
+                _elapsed_ms(started_at),
+                status="error",
+                details={"sample_rate": audio_config.sample_rate, "channels": audio_config.channels},
+            )
             if ws.client_state == WebSocketState.CONNECTED:
                 await ws.send_json({"type": "error", "error": str(e)})
 
@@ -330,6 +527,11 @@ async def audio_ws(ws: WebSocket, session_id: str):
             except WebSocketDisconnect:
                 log.info(f"Audio client disconnected: session={session_id}")
                 break
+            except RuntimeError as e:
+                if "disconnect message has been received" in str(e).lower():
+                    log.info(f"Audio client disconnected: session={session_id}")
+                    break
+                raise
 
             if "bytes" in data and data["bytes"] is not None:
                 chunk = data["bytes"]
@@ -375,6 +577,7 @@ async def audio_ws(ws: WebSocket, session_id: str):
                         except ValueError as e:
                             await ws.send_json({"type": "error", "error": str(e)})
                             continue
+                        commit_driven_mode = True
 
                         await ws.send_json(
                             {
@@ -420,16 +623,18 @@ async def audio_ws(ws: WebSocket, session_id: str):
 
             current_time = time.time()
             max_buffer_size = audio_config.max_buffer_bytes()
-            if audio_buffer and (
-                (current_time - last_audio_time > silence_timeout)
-                or len(audio_buffer) >= max_buffer_size
-            ):
+            should_flush = current_time - last_audio_time > silence_timeout
+            if not commit_driven_mode:
+                should_flush = should_flush or len(audio_buffer) >= max_buffer_size
+
+            if audio_buffer and should_flush:
                 await flush_audio_buffer()
 
     except WebSocketDisconnect:
         log.info(f"Audio WebSocket disconnected: session={session_id}")
     except Exception as e:
         log.error(f"Audio WebSocket error [{session_id}]: {e}")
+        store.record_error(session_id, "ws.audio", str(e))
         try:
             if ws.client_state == WebSocketState.CONNECTED:
                 await ws.close(code=1011, reason=str(e))
@@ -446,24 +651,33 @@ async def tts_ws(ws: WebSocket, session_id: str):
     try:
         while True:
             raw = await ws.receive_text()
+            started_at = time.perf_counter()
 
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
+                store.record_error(session_id, "ws.tts", "Invalid JSON")
+                store.record_latency(session_id, "ws.tts", _elapsed_ms(started_at), status="error")
                 await ws.send_json({"type": "error", "error": "Invalid JSON"})
                 continue
 
             if msg.get("type") != "synthesize":
+                message = "Expected {type: 'synthesize', text: '...'}"
+                store.record_error(session_id, "ws.tts", message)
+                store.record_latency(session_id, "ws.tts", _elapsed_ms(started_at), status="error")
                 await ws.send_json(
                     {
                         "type": "error",
-                        "error": "Expected {type: 'synthesize', text: '...'}",
+                        "error": message,
                     }
                 )
                 continue
 
             cleaned_text = clean_transcript(msg.get("text", ""))
             if not cleaned_text:
+                message = "TTS input cannot be empty."
+                store.record_error(session_id, "ws.tts", message)
+                store.record_latency(session_id, "ws.tts", _elapsed_ms(started_at), status="error")
                 await ws.send_json({"type": "error", "error": "TTS input cannot be empty."})
                 continue
 
@@ -490,6 +704,8 @@ async def tts_ws(ws: WebSocket, session_id: str):
                     preferred_language=msg.get("language"),
                 )
             except Exception as e:
+                store.record_error(session_id, "ws.tts", str(e))
+                store.record_latency(session_id, "ws.tts", _elapsed_ms(started_at), status="error")
                 await ws.send_json({"type": "error", "error": str(e)})
                 continue
 
@@ -521,11 +737,28 @@ async def tts_ws(ws: WebSocket, session_id: str):
                     "audio_b64": result.audio_b64,
                 }
             )
+            message_languages = msg.get("languages") or []
+            if message_languages:
+                store.track_languages(session_id, set(message_languages))
+            if result.language:
+                store.set_selected_language(session_id, result.language)
+            store.record_latency(
+                session_id,
+                "ws.tts",
+                _elapsed_ms(started_at),
+                status="ok",
+                details={
+                    "provider": result.provider,
+                    "language": result.language,
+                    "segment_count": len(result.segments),
+                },
+            )
 
     except WebSocketDisconnect:
         log.info(f"TTS WebSocket disconnected: session={session_id}")
     except Exception as e:
         log.error(f"TTS WebSocket error [{session_id}]: {e}")
+        store.record_error(session_id, "ws.tts", str(e))
         try:
             if ws.client_state == WebSocketState.CONNECTED:
                 await ws.send_json({"type": "error", "error": str(e)})

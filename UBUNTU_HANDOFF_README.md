@@ -2,7 +2,7 @@
 
 Date: 2026-04-03
 
-This file is the continuation brief for the Ubuntu Codex session that will run the project inside the real Ubuntu venv with the required speech/runtime libraries installed.
+This file is the continuation brief for the most recent Ubuntu Codex session that ran the project inside the real Ubuntu venv with the required speech/runtime libraries installed.
 
 ## 1. Current Repository State
 
@@ -11,14 +11,15 @@ The repository has been statically reviewed against `nudiscribe_build_plan.txt`.
 Current conclusion:
 
 - backend Phases 1 to 5 are implemented in code
-- Phase 5 is code-complete in-repo, but still needs real runtime verification on Ubuntu
-- Phase 6 and Phase 7 are not started
+- Phase 5 was runtime-validated on Ubuntu with a real speech provider
+- Phase 6 now has a working SQLite-backed persistence foundation
+- Phase 7 is not started
 - the build plan includes a frontend, but this repository is backend-only
 
 Important constraint:
 
-- this pass did not execute the backend, tests, or model runtimes
-- Ubuntu must perform the actual runtime verification
+- AI4Bharat Hindi/Kannada assets are still not configured in the current Ubuntu env
+- the persistence layer is implemented for local development with SQLite, not PostgreSQL
 
 ## 2. What Was Completed In The Latest Pass
 
@@ -43,6 +44,15 @@ Important constraint:
 - added `backend/app/product_smoke_test.py`
 - updated the README and handoff flow to use the smoke test
 - added `BUILD_PLAN_ALIGNMENT.md` for a phase-by-phase build-plan snapshot
+
+### Ubuntu validation and Phase 6 follow-up
+
+- executed the full Ubuntu Phase 5 validation flow in the project venv
+- wired the existing local Piper runtime into `backend/.env` so a real speech provider was available
+- verified REST chat, REST TTS, text WebSocket, TTS WebSocket, upload transcription, and audio WebSocket flows
+- identified that `backend/temp_audio_test.wav` is not a valid RIFF/WAV file and used a generated Piper WAV for the optional audio pass
+- replaced the in-memory `MemoryStore` with a SQLite-backed persistence store
+- started persisting session history, transcripts, selected language, latency, and errors
 
 ## 3. Files That Matter Most
 
@@ -72,8 +82,8 @@ Short version:
 - Phase 2: implemented
 - Phase 3: implemented
 - Phase 4: implemented
-- Phase 5: implemented in code, runtime verification pending
-- Phase 6: pending
+- Phase 5: implemented and runtime-validated on Ubuntu
+- Phase 6: started with SQLite-backed persistence
 - Phase 7: pending
 
 Out-of-repo scope:
@@ -96,44 +106,13 @@ Ubuntu should verify that the current backend can do all of the following:
 7. report degraded status if only fallback or missing runtime pieces are present
 8. optionally validate transcription and audio WebSocket flow if a sample WAV is available
 
-## 6. Required Ubuntu Actions
+## 6. Ubuntu Validation Commands Executed And Results
 
-Do these in order.
-
-### Step 1: Activate the real environment
-
-- activate the Ubuntu venv used for this project
-- work from the repository root unless a command explicitly says `backend/`
-
-### Step 2: Check runtime configuration
-
-- confirm whether you are using repo-root `.env` or `backend/.env`
-- confirm `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_TIMEOUT`
-- confirm all Hindi and Kannada AI4Bharat asset paths if real Indic-TTS is expected
-- confirm Piper or Coqui fallback values if they are intentionally used
-
-### Step 3: Run static validation inside Ubuntu
-
-From repo root:
+Exact commands executed:
 
 ```bash
-python backend/app/product_smoke_test.py --self-check --run-command-probes
-```
-
-This should confirm:
-
-- visible env file paths
-- required Python packages
-- optional packages
-- TTS provider diagnostics
-- whether a real speech provider is actually available
-
-### Step 4: Compile the backend files
-
-From repo root:
-
-```bash
-python -m py_compile \
+venv/bin/python backend/app/product_smoke_test.py --self-check --run-command-probes
+venv/bin/python -m py_compile \
   backend/app/config.py \
   backend/app/main.py \
   backend/app/api.py \
@@ -145,47 +124,43 @@ python -m py_compile \
   backend/app/asr/segmenter.py \
   backend/app/asr/whisper_asr.py \
   backend/app/asr/indic_asr.py
+cd backend && ../venv/bin/uvicorn app.main:app --reload
+venv/bin/python backend/app/product_smoke_test.py --base-url http://127.0.0.1:8000 --timeout 180
+venv/bin/python backend/app/product_smoke_test.py --base-url http://127.0.0.1:8000 --audio-file /media/raviteja/Volume/nudiscribe/backend/temp_audio_test.wav --timeout 180
+file /media/raviteja/Volume/nudiscribe/backend/temp_audio_test.wav /media/raviteja/Volume/nudiscribe/smoke_test_artifacts/tts_rest_output.wav
+venv/bin/python backend/app/product_smoke_test.py --base-url http://127.0.0.1:8000 --audio-file /media/raviteja/Volume/nudiscribe/smoke_test_artifacts/tts_rest_output.wav --timeout 180
+venv/bin/python -m py_compile backend/app/config.py backend/app/main.py backend/app/api.py backend/app/memory.py
+venv/bin/python -m py_compile backend/app/api.py
+venv/bin/python backend/app/product_smoke_test.py --base-url http://127.0.0.1:8000 --audio-file /media/raviteja/Volume/nudiscribe/smoke_test_artifacts/tts_rest_output.wav --timeout 180
 ```
 
-### Step 5: Start the backend
+What passed:
 
-From `backend/`:
+- static self-check passed once Piper was configured in `backend/.env`
+- `py_compile` passed for the validated backend files
+- `GET /`
+- `GET /api/health`
+- `POST /api/chat`
+- `POST /api/tts` with real Piper WAV output
+- `ws://.../ws/{session_id}`
+- `ws://.../ws/tts/{session_id}` with `audio_chunk` and `final`
+- `POST /api/transcribe` using a valid generated WAV sample
+- `ws://.../ws/audio/{session_id}` using a valid generated WAV sample
 
-```bash
-uvicorn app.main:app --reload
-```
+What failed and was fixed:
 
-### Step 6: Run the live smoke test
-
-From repo root:
-
-```bash
-python backend/app/product_smoke_test.py --base-url http://127.0.0.1:8000
-```
-
-This command intentionally treats tone fallback as a failure because full Phase 5 validation requires a real speech provider.
-
-Optional audio/transcription check:
-
-```bash
-python backend/app/product_smoke_test.py \
-  --base-url http://127.0.0.1:8000 \
-  --audio-file /absolute/path/to/sample.wav
-```
-
-### Step 7: Inspect failures and patch only what is necessary
-
-If the smoke test fails:
-
-- inspect the exact failing endpoint or provider
-- fix the smallest runtime issue first
-- rerun self-check and live smoke test
-- do not redesign APIs unless a concrete bug requires it
-- only use `--allow-tone-fallback` for temporary debugging, not for the final Phase 5 sign-off
+- initial self-check failed because no real speech provider was configured
+- fixed by binding the existing local Piper runtime in `backend/.env`:
+  - `PIPER_BINARY=/tmp/nudiscribe_runtime/piper/piper/piper`
+  - `PIPER_VOICE_EN=/tmp/nudiscribe_runtime/piper/voices/en_US-lessac-low.onnx`
+- the bundled file `backend/temp_audio_test.wav` failed the optional audio checks because it is not a valid RIFF/WAV file
+- fixed by switching the optional audio validation to `/media/raviteja/Volume/nudiscribe/smoke_test_artifacts/tts_rest_output.wav`, which was generated by the successful real-speech TTS pass
+- after the Phase 6 persistence changes, the audio WebSocket still emitted noisy disconnect errors in server logs after `final`
+- fixed by treating configured audio sessions as commit-driven and by handling disconnect-after-final as a normal client close
 
 ## 7. What “Done” Means For Phase 5
 
-Phase 5 should be treated as fully validated only when Ubuntu confirms all of the following:
+Phase 5 has now been validated on Ubuntu. The following checks were satisfied:
 
 - `GET /api/health` returns usable readiness information
 - `POST /api/chat` works end to end
@@ -217,7 +192,8 @@ Ubuntu should expect the following categories of issues if anything still fails:
 
 These remain Phase 6 or later tasks:
 
-- persistent storage for sessions, transcripts, latency, and errors
+- automated tests around the new SQLite persistence boundary
+- decide whether to keep SQLite for local use only or add PostgreSQL/SQLAlchemy next
 - automated test suite and CI execution
 - Docker and deployment setup
 - auth or access control
@@ -226,18 +202,18 @@ These remain Phase 6 or later tasks:
 
 ## 10. Recommended Next Step After Ubuntu Validation
 
-If Ubuntu verifies Phase 5 successfully, begin Phase 6 with this order:
+The immediate next step after the successful Ubuntu validation is to continue Phase 6 with this order:
 
-1. choose persistence approach and schema
-2. replace `MemoryStore` with a persistence-backed implementation
-3. store session history and transcripts
-4. store latency and error metadata
-5. add tests around the persistence boundary
+1. add tests around `backend/app/memory.py` and the API persistence hooks
+2. inspect the generated SQLite data model and confirm it matches the desired product reporting needs
+3. decide whether PostgreSQL/SQLAlchemy should replace or sit behind the current SQLite layer
+4. expose persisted transcript or telemetry retrieval endpoints only if the product actually needs them
 
 ## 11. Guidance For The Next Codex Session
 
 - trust `BUILD_PLAN_ALIGNMENT.md` for plan status
 - trust `backend/app/product_smoke_test.py` for the current validation path
+- trust `backend/app/memory.py` as the current Phase 6 persistence boundary
 - do not remove the TTS readiness diagnostics
 - do not treat tone fallback as a substitute for real TTS readiness
 - keep the current API shapes unless a concrete runtime bug forces a change

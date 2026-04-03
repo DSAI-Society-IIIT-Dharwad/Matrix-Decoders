@@ -6,20 +6,30 @@ This document maps the current repository state to `nudiscribe_build_plan.txt`.
 
 Validation mode for this pass:
 
-- static code and documentation review only
-- no backend startup
-- no test execution
-- no network or model-runtime verification
+- static code and documentation review
+- Ubuntu runtime validation executed in the project venv
+- backend startup verified in the current local workspace
+- the active local `.env` is configured for audio-only validation, so real-speech TTS is not exercised in this run
 
 ## Overall Status
 
-The repository now covers the backend side of build-plan Phases 1 through 5 in code.
+The repository now covers the backend side of build-plan Phases 1 through 6 in code, but the current workspace is configured for audio-only validation and does not exercise TTS at startup.
 
 Important scope limits:
 
 - the build plan includes a frontend, but this repository is backend-only
-- Phase 5 is code-complete in-repo, but real runtime verification must be executed on Ubuntu with the project venv and model assets
-- Phases 6 and 7 are still pending
+- the hackathon problem statement adds structured extraction, editable review, dashboards, and domain workflows that are not yet implemented here
+- Phase 5 TTS code exists, but the active local runtime keeps TTS disabled
+- Phase 6 now has a working SQLite-backed persistence foundation; PostgreSQL/SQLAlchemy are still future work
+- Phase 7 is still pending
+
+## Problem Statement Alignment
+
+`IDRP_PS.pdf` describes a broader conversational intelligence system than the technical build plan alone. Current coverage is:
+
+- covered: multilingual ASR for Kannada, Hindi, English, and code-mixed speech; Ollama-driven conversational backend; persisted interaction history
+- partial: live voice intake via WebSocket audio/file upload and conversational response streaming, but only as a backend pipeline
+- missing: secure in-person recording, automated outbound call handling, structured data extraction, editable review interface, searchable dashboard/history, domain-specific workflow configuration, and compliance/security hardening
 
 ## Phase 1 - Core Text Pipeline
 
@@ -135,8 +145,9 @@ Repository status:
 - [x] merged WAV generation exists
 - [x] merged WAV normalization exists
 - [x] runtime validation exists
-- [x] smoke-test entrypoint exists and rejects tone fallback by default during live Phase 5 validation
-- [ ] real runtime verification on Ubuntu still needs to be executed
+- [x] smoke-test entrypoint exists for self-check and live backend testing
+- [ ] the current local runtime is audio-only, so real-speech TTS is not exercised by default
+- [ ] AI4Bharat Hindi/Kannada assets are still not configured in the current workspace
 - [ ] frontend playback layer is not part of this repository
 
 Primary files:
@@ -158,10 +169,12 @@ Build-plan intent:
 
 Repository status:
 
-- [x] in-memory session storage exists
-- [ ] persistent database storage is not implemented
-- [ ] transcript persistence is not implemented
-- [ ] latency/error persistence is not implemented
+- [x] persistence-backed session storage exists
+- [x] session language and selected-language persistence exists
+- [x] transcript persistence exists
+- [x] latency/error persistence exists
+- [x] relative SQLite persistence paths now resolve against the repository root
+- [ ] PostgreSQL/SQLAlchemy are not implemented; the current persistence layer uses local SQLite
 
 Primary files:
 
@@ -179,23 +192,23 @@ Repository status:
 
 - [ ] not implemented
 
-## Static Consistency Fixes Applied In This Pass
+## Runtime And Persistence Updates Applied In This Pass
 
 - config loading now supports both repo-root `.env` and `backend/.env`
-- health output now distinguishes general TTS readiness from real-speech provider readiness
-- runtime validation now reports missing packages and provider issues
+- relative SQLite paths now resolve against the repository root, so the database stays stable regardless of launch directory
+- health output now reflects the currently available TTS providers without making audio-only validation fatal
+- runtime validation now skips unused TTS provider diagnostics when TTS is disabled
 - product smoke-test file now exists for self-check and live backend testing
 - TTS merging now normalizes WAV format before combining segments
+- the active local runtime is configured for audio-only validation
+- the backend now persists session history, transcripts, selected language, latencies, and errors to SQLite
 - several encoding-affected files were normalized to plain text
 - local-client dependency alignment was improved by listing `sounddevice` in `backend/requirements.txt`
 
-## What Still Must Happen On Ubuntu
+## What Still Must Happen Next
 
-1. Activate the project venv.
-2. Confirm `.env` values for Ollama and TTS assets.
-3. Run `python backend/app/product_smoke_test.py --self-check --run-command-probes`.
-4. Run `python -m py_compile` over the backend files.
-5. Start FastAPI from `backend/`.
-6. Run the live smoke test.
-7. If any provider or endpoint fails, patch only the failing runtime issue and rerun the smoke test.
-8. When all Phase 5 runtime checks pass, start Phase 6 work.
+1. Add automated tests around the new persistence boundary.
+2. Add the structured extractor, editable review surface, and searchable dashboard implied by the hackathon problem statement.
+3. Decide whether to keep the workspace audio-only or re-enable a real TTS provider for speech output validation.
+4. Decide whether to keep SQLite for local-only use and add PostgreSQL/SQLAlchemy for fuller Phase 6 alignment.
+5. Continue with Phase 7 containerization and deployment work.

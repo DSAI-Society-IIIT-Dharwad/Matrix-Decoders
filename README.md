@@ -35,7 +35,7 @@ Core modules in the current implementation:
 - `backend/app/asr/`: ASR routing and model adapters
 - `backend/app/language.py`: script and language heuristics
 - `backend/app/ollama_client.py`: Ollama streaming client
-- `backend/app/memory.py`: in-memory session tracking
+- `backend/app/memory.py`: SQLite-backed session and telemetry persistence
 - `backend/app/prompt.py`: language-aware prompting strategy
 - `backend/app/tts_router.py`: AI4Bharat-first TTS routing with fallback providers
 
@@ -46,7 +46,7 @@ Core modules in the current implementation:
 - `POST /api/chat` for text-based multilingual chat
 - `POST /api/transcribe` for uploaded audio transcription
 - `DELETE /api/session/{session_id}` to clear session memory
-- `GET /api/sessions` to inspect active in-memory sessions
+- `GET /api/sessions` to inspect active persisted sessions
 - `WebSocket /ws/{session_id}` for streaming text chat
 - `WebSocket /ws/audio/{session_id}` for streaming audio input
 - Whisper-based transcription path for English and general fallback
@@ -54,7 +54,7 @@ Core modules in the current implementation:
 - heuristic merging of Whisper and Indic ASR outputs
 - detection of Devanagari, Kannada, English, and some Romanized Hindi/Kannada patterns
 - language-aware prompting so the assistant mirrors the user’s language style
-- in-memory conversation history with bounded context window
+- persisted conversation history with a bounded context window
 - example client scripts for manual text and audio testing
 
 ## Current Status
@@ -72,7 +72,7 @@ What is already in place:
 What is not yet complete:
 
 - no frontend application is included
-- no persistent database or durable session storage is implemented
+- the persistence layer currently targets a local SQLite database for development, not a production PostgreSQL deployment
 - no authentication or access control exists
 - no automated test suite is present
 - no containerization or deployment configuration is included
@@ -81,6 +81,8 @@ What is not yet complete:
 - multilingual quality is heuristic-driven and still needs evaluation against real usage data
 
 In practical terms, this repository should be viewed as a functional backend prototype, not a production-ready application.
+
+For the current workflow-to-code map and the phase-by-phase construction tracker, see [PHASE_CONSTRUCTION_TRACKER.md](/media/raviteja/Volume/nudiscribe/PHASE_CONSTRUCTION_TRACKER.md).
 
 ## Architecture Overview
 
@@ -155,6 +157,7 @@ The backend uses environment variables for configuration. Typical values include
 - `OLLAMA_BASE_URL`
 - `OLLAMA_MODEL`
 - `OLLAMA_TIMEOUT`
+- `PERSISTENCE_DB_PATH`
 - `INDIC_TTS_MODEL_HI`
 - `INDIC_TTS_CONFIG_HI`
 - `INDIC_TTS_VOCODER_HI`
@@ -254,7 +257,7 @@ python app/product_smoke_test.py --base-url http://127.0.0.1:8000 --audio-file /
 
 ## Known Limitations
 
-- session memory is stored only in process memory
+- local persistence currently uses a single SQLite file and does not yet provide multi-node or production-grade database behavior
 - multilingual detection is heuristic-based, not model-evaluated
 - no benchmark data is included for transcription quality
 - audio pipeline behavior is still prototype-grade and needs protocol hardening
@@ -277,7 +280,7 @@ The next phase of development should focus on moving from prototype to reliable 
 ### Product and Platform Work
 
 - build a frontend interface for chat and voice interaction
-- add persistent session storage
+- add structured extraction, editable review, and dashboard surfaces from the hackathon problem statement
 - add user authentication and authorization
 - introduce configuration profiles for local, staging, and production
 - containerize the backend with Docker
@@ -289,7 +292,7 @@ The next phase of development should focus on moving from prototype to reliable 
 - improve code-mixed transcription quality evaluation
 - support additional Indian languages
 - add better language confidence scoring
-- support real text-to-speech output
+- configure and validate real speech TTS assets for AI4Bharat and/or Piper in the active runtime
 - explore streaming ASR improvements and lower-latency audio handling
 - tune prompts and model behavior for multilingual conversational consistency
 

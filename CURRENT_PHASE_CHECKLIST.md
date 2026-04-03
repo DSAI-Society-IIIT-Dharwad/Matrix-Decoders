@@ -11,17 +11,18 @@ This status review is based on:
 - `backend/requirements.txt`
 - all current source files under `backend/app/`
 
-This pass was validated statically in the current workspace without running the backend or test commands.
+This pass now includes Ubuntu runtime validation in audio-only mode plus the first persistence implementation pass.
 
 ## Phase Assessment
 
-The backend implementation has moved past the ASR and code-mixed-routing stages and now has a completed in-repo `Phase 5 - Add TTS` implementation, including readiness diagnostics and a smoke-test entrypoint.
+The backend implementation now has a validated audio-first runtime: audio WebSocket input -> ASR -> LLM -> persistence. TTS code exists in the repository, but the active local `.env` keeps TTS disabled, so the current workspace is not exercising speech output by default.
 
 Important nuance:
 
 - backend coverage for Phases 1-4 is largely present
 - product-level Phase 1 is not fully complete because the build plan expects a frontend text UI/display and this repo has no frontend
-- Phase 6 is not started in the build-plan sense because session memory is still in-process only and there is no database or persistence layer
+- Phase 5 TTS is implemented in code but is inactive in the current local runtime
+- Phase 6 is the active foundation: SQLite persistence, transcript/telemetry persistence, and stable DB path resolution
 
 ## Workflow Phase Summary
 
@@ -29,50 +30,43 @@ Important nuance:
 - [x] Phase 2 Whisper ASR
 - [x] Phase 3 IndicConformer routing
 - [x] Phase 4 segment-based code-mixed routing
-- [x] Phase 5 TTS fully complete in repository code
-- [ ] Phase 6 persistence
+- [x] Phase 5 TTS code path exists, but it is disabled in the current local runtime
+- [x] Phase 6 persistence foundation
 - [ ] Phase 7 containerization and deployment
 
-## Current Phase Checklist: Phase 5 - TTS Integration And Verification
+## Current Phase Checklist: Phase 6 - Persistence Foundation
 
 ### Completed In This Phase
 
-- [x] `POST /api/tts` is implemented
-- [x] `ws://.../ws/tts/{session_id}` is implemented
-- [x] the orchestrator emits a sentence-level `tts_plan`
-- [x] the orchestrator emits structured `tts_segments` metadata for downstream synthesis
-- [x] the TTS router uses a provider stack of AI4Bharat Indic -> Piper -> Coqui -> tone fallback
-- [x] segment-wise synthesis returns per-segment audio metadata
-- [x] final merged WAV output is produced from segment audio
-- [x] `.env.example` contains AI4Bharat model/config/vocoder variables for Hindi and Kannada
-- [x] `backend/requirements.txt` includes the `TTS` dependency
-- [x] a manual TTS WebSocket test client exists
-- [x] a product smoke-test entrypoint exists for static checks and live backend checks
-- [x] startup/runtime validation reports TTS provider readiness and warnings
-- [x] merged WAV output is normalized to a single output format before batching
-- [x] config loading supports both `backend/.env` and repo-root `.env`
+- [x] Ubuntu smoke-test self-check now passes in the active audio-only workspace
+- [x] the audio WebSocket input path is the current ingestion path for later workflows
+- [x] the backend now persists session history to SQLite
+- [x] the backend now persists transcripts, selected language, latency, and errors
+- [x] relative `PERSISTENCE_DB_PATH` values now resolve against the repository root
+- [x] `.env.example` now includes `PERSISTENCE_DB_PATH`
+- [x] `backend/.env` is configured for audio-only validation in this workspace
 
 ### Remaining In This Phase
 
-- [ ] execute the smoke test on the Ubuntu runtime with the real venv and model assets
-- [ ] bind real Hindi AI4Bharat asset paths in `.env` if they are not already present on Ubuntu
-- [ ] bind real Kannada AI4Bharat asset paths in `.env` if they are not already present on Ubuntu
-- [ ] run end-to-end verification for `POST /api/tts` with real speech output
-- [ ] run end-to-end verification for `ws://.../ws/tts/{session_id}` and inspect both `audio_chunk` and `final` events
-- [ ] connect synthesized audio to a frontend playback flow because no frontend exists in this repository
+- [ ] add automated tests around the persistence boundary
+- [ ] add structured extraction, review, or reporting surfaces required by the hackathon problem statement
+- [ ] decide whether to keep the workspace audio-only or re-enable a real TTS provider later
+- [ ] add retrieval/reporting surfaces for persisted transcripts and telemetry if the product needs them
+- [ ] connect the audio workflow to a frontend playback or review flow because no frontend exists in this repository
 
 ## Not Started Yet: Next Workflow Phase
 
-These items belong to the next build-plan phase after TTS verification and are still pending:
+These items belong to the next build-plan phase after persistence and are still pending:
 
-- [ ] persistent storage for session history, transcripts, latency, and errors
 - [ ] automated tests
 - [ ] Docker or deployment setup
 - [ ] CI and observability
 - [ ] auth or access control
+- [ ] editable structured report and dashboard surfaces from the problem statement
 
 ## Notes
 
-- the most accurate status document right now is `UBUNTU_HANDOFF_README.md`, which correctly describes AI4Bharat TTS as partially implemented
+- the most accurate status document right now is `UBUNTU_HANDOFF_README.md`, which records the completed Ubuntu validation and the current persistence status
+- `BUILD_PLAN_ALIGNMENT.md` now captures the broader gap between the technical build plan and the hackathon problem statement
 - `README.md` now includes the smoke-test workflow and supports either repo-root `.env` or `backend/.env`
 - `README.md` and several source files still contain encoding/mojibake artifacts and should be cleaned up in a later hardening pass

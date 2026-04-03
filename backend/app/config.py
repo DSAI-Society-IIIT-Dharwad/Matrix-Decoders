@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,6 +23,7 @@ class Settings(BaseSettings):
     ollama_timeout: int = 120
     max_context_messages: int = 10
     default_response_language: str = "auto"
+    persistence_db_path: str = str(BACKEND_ROOT / "data" / "nudiscribe.db")
 
     # ASR settings
     whisper_model_size: str = "base"
@@ -55,6 +57,19 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @field_validator("persistence_db_path", mode="before")
+    @classmethod
+    def _resolve_persistence_db_path(cls, value):
+        """Resolve relative database paths against the repository root."""
+        if value in {None, ""}:
+            return value
+
+        path = Path(str(value)).expanduser()
+        if path.is_absolute():
+            return str(path)
+
+        return str((REPO_ROOT / path).resolve())
 
 
 settings = Settings()
