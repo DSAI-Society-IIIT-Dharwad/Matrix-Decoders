@@ -1,6 +1,6 @@
 # Phase Construction Tracker
 
-Date: 2026-04-03
+Date: 2026-04-04
 
 This file is the working construction log for the current repository. It has three jobs:
 
@@ -33,7 +33,7 @@ The intended runtime flow is:
 
 1. input arrives as text, uploaded audio, or streamed PCM audio
 2. audio is normalized, buffered, and segmented
-3. ASR routing sends English-heavy speech toward Whisper and Hindi/Kannada-heavy speech toward Indic ASR
+3. ASR routing sends English-heavy speech toward Whisper, with the current default staying on base Whisper while fine-tuned checkpoints remain available for controlled comparison, and Hindi/Kannada-heavy speech toward Indic ASR
 4. transcript cleanup normalizes text and attaches language metadata
 5. orchestration builds a language-aware prompt and streams the request to Ollama
 6. the assistant response is split into TTS-ready segments
@@ -67,7 +67,7 @@ The intended runtime flow is:
 - [backend/app/asr/router.py](/media/raviteja/Volume/nudiscribe/backend/app/asr/router.py)
   ASR routing and merge strategy
 - [backend/app/asr/whisper_asr.py](/media/raviteja/Volume/nudiscribe/backend/app/asr/whisper_asr.py)
-  Whisper adapter
+  Whisper adapter with optional local fine-tuned checkpoint loading and base-model fallback
 - [backend/app/asr/indic_asr.py](/media/raviteja/Volume/nudiscribe/backend/app/asr/indic_asr.py)
   IndicConformer adapter
 - [backend/app/transcript_cleaner.py](/media/raviteja/Volume/nudiscribe/backend/app/transcript_cleaner.py)
@@ -110,6 +110,9 @@ Changes made:
 
 - reused a module-level ASR router in [backend/app/api.py](/media/raviteja/Volume/nudiscribe/backend/app/api.py) instead of constructing it inside every `/api/transcribe` request
 - reused a module-level Ollama client in [backend/app/api.py](/media/raviteja/Volume/nudiscribe/backend/app/api.py) for health checks
+- wired [backend/app/asr/whisper_asr.py](/media/raviteja/Volume/nudiscribe/backend/app/asr/whisper_asr.py) to support valid local fine-tuned checkpoints with explicit fallback to the configured base Whisper model
+- extended [backend/app/runtime_validation.py](/media/raviteja/Volume/nudiscribe/backend/app/runtime_validation.py) so self-check output shows ASR checkpoint candidates and runtime preference settings
+- benchmarked the currently available checkpoints and kept base Whisper as the default runtime because the available fine-tuned outputs did not beat it on the known-text sample
 - avoided repeated TTS provider list computation in the health endpoint
 - added [backend/backend/](/media/raviteja/Volume/nudiscribe/backend/backend/) to `.gitignore` because it is a stale duplicate persistence path from an older relative-path bug
 - updated [README.md](/media/raviteja/Volume/nudiscribe/README.md) so the roadmap reflects the current implementation instead of older prototype assumptions
@@ -146,12 +149,15 @@ Completed:
 - upload transcription endpoint
 - audio WebSocket endpoint
 - Whisper adapter
+- runtime loading of local fine-tuned Whisper checkpoints
+- base Whisper kept as the selected default after checkpoint benchmarking
 - manual audio test path
 
 Remaining:
 
 - browser/client capture UI
 - more robust live-audio protocol testing
+- collect a stronger multilingual benchmark set before reconsidering fine-tuned checkpoints as the default runtime
 
 ### Phase 3 - Indic ASR routing
 
@@ -232,4 +238,5 @@ Add after the thin frontend exists, one slice at a time:
 1. keep the backend stable around the current workflow contract
 2. build the thin frontend on top of the existing REST and WebSocket endpoints
 3. add tests for `memory.py`, ASR routing, transcript cleanup, and the TTS router
-4. turn the hackathon-only feature set into explicit vertical slices instead of a single large catch-up phase
+4. add tests for runtime Whisper checkpoint selection and fallback behavior
+5. turn the hackathon-only feature set into explicit vertical slices instead of a single large catch-up phase

@@ -240,7 +240,7 @@ python app/product_smoke_test.py --base-url http://127.0.0.1:8000 --audio-file /
 
 ## Multilingual ASR Training
 
-The repo now includes an offline ASR corpus builder and Whisper fine-tuning entrypoint at [backend/app/train_asr.py](/media/raviteja/Volume/nudiscribe/backend/app/train_asr.py). It is designed to improve the current prototype toward a lower-latency multilingual speech engine without disturbing the live inference path.
+The repo now includes an offline ASR corpus builder and Whisper fine-tuning entrypoint at [backend/app/train_asr.py](/media/raviteja/Volume/nudiscribe/backend/app/train_asr.py). The live Whisper runtime can compare against local fine-tuned checkpoints, but the current default runtime selection remains the base Whisper model because the latest checkpoint benchmark has not yet shown a quality win.
 
 The dataset inventory used by that builder is listed separately in [DATASETS.md](/media/raviteja/Volume/nudiscribe/backend/app/training/DATASETS.md) and implemented in [dataset_sources.py](/media/raviteja/Volume/nudiscribe/backend/app/training/dataset_sources.py).
 
@@ -256,6 +256,7 @@ What it does:
 - synthesizes extra code-mixed training clips when native code-mixed coverage is thin
 - optionally archives live product audio into a weakly supervised local corpus for later continual training
 - continues Whisper fine-tuning from the latest checkpoint if one already exists
+- supports loading a valid local fine-tuned Whisper checkpoint at runtime when `ASR_RUNTIME_PREFER_FINETUNED=true`
 
 Curated Hugging Face sources wired into the corpus builder:
 
@@ -296,6 +297,13 @@ Generated artifacts:
 - consolidated manifests at `backend/data/asr_corpus/manifests/train_all.jsonl` and `backend/data/asr_corpus/manifests/eval_all.jsonl`
 - local runtime archive at `backend/data/asr_corpus/local_archive/weak_supervision.jsonl`
 - fine-tuned checkpoints under `backend/data/asr_checkpoints/`
+
+Runtime selection:
+
+- the current default is `ASR_RUNTIME_PREFER_FINETUNED=false`, which keeps the runtime on the base Whisper model
+- when `ASR_RUNTIME_PREFER_FINETUNED=true` and valid checkpoint files exist under `ASR_CHECKPOINT_DIR`, [backend/app/asr/whisper_asr.py](/media/raviteja/Volume/nudiscribe/backend/app/asr/whisper_asr.py) loads that local checkpoint first
+- if checkpoint loading or inference fails, the runtime falls back to `ASR_BASE_MODEL`
+- keep `ASR_RUNTIME_PREFER_FINETUNED=false` until a benchmark shows the fine-tuned checkpoint materially improves multilingual accuracy
 
 ## API Summary
 

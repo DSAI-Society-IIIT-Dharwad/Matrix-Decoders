@@ -199,15 +199,51 @@ Removed old smoke artifacts and stale runs:
 - `/home/raviteja/nudiscribe/asr_checkpoints_smoke*`
 - old oversized/stale `asr_corpus` and empty `asr_checkpoints` were replaced by the new bounded run outputs.
 
-## 8) Current Known Gap
+## 8) Current Runtime Status
 
-Live API inference is still using `backend/app/asr/whisper_asr.py` with hardcoded `whisper.load_model("base")`.
+Live API/runtime transcription can use the local fine-tuned Whisper checkpoint under `/home/raviteja/nudiscribe/asr_checkpoints`, but the selected default runtime is now the base Whisper model with `ASR_RUNTIME_PREFER_FINETUNED=false`.
 
-This means:
+Fallback behavior now in place:
 
-- training artifacts are ready and valid
-- runtime transcription has not yet been switched to load the fine-tuned checkpoint from `/home/raviteja/nudiscribe/asr_checkpoints`
+- if `ASR_RUNTIME_PREFER_FINETUNED=true` and a valid fine-tuned checkpoint is present, `backend/app/asr/whisper_asr.py` loads it first
+- if checkpoint loading fails, runtime falls back to the base Whisper model derived from `ASR_BASE_MODEL`
+- the repository now keeps base-model Whisper selected by default with `ASR_RUNTIME_PREFER_FINETUNED=false`
+
+Direct validation executed in this follow-up pass:
+
+```bash
+/home/raviteja/nudiscribe/venv/bin/python -m py_compile \
+  /media/raviteja/Volume/nudiscribe/backend/app/asr/whisper_asr.py \
+  /media/raviteja/Volume/nudiscribe/backend/app/asr/router.py \
+  /media/raviteja/Volume/nudiscribe/backend/app/api.py \
+  /media/raviteja/Volume/nudiscribe/backend/app/config.py
+
+/home/raviteja/nudiscribe/venv/bin/python -c "import sys; sys.path.insert(0, '/media/raviteja/Volume/nudiscribe/backend'); from app.asr import whisper_asr; runtime = whisper_asr._load_runtime(); print({'kind': getattr(runtime, 'kind', 'unknown'), 'model_path': str(getattr(runtime, 'model_path', '')), 'model_name': getattr(runtime, 'model_name', '')})"
+
+/home/raviteja/nudiscribe/venv/bin/python -c "import sys; sys.path.insert(0, '/media/raviteja/Volume/nudiscribe/backend'); from app.asr import whisper_asr; runtime = whisper_asr._build_runtime(force_base=True); print({'kind': getattr(runtime, 'kind', 'unknown'), 'model_name': getattr(runtime, 'model_name', '')})"
+
+/home/raviteja/nudiscribe/venv/bin/python -c "import sys; sys.path.insert(0, '/media/raviteja/Volume/nudiscribe/backend'); from app.asr.whisper_asr import transcribe_with_language; text, lang = transcribe_with_language('/media/raviteja/Volume/nudiscribe/smoke_test_artifacts/tts_rest_output.wav'); print({'language': lang, 'text': text[:300]})"
+```
+
+Observed results:
+
+- the opt-in fine-tuned runtime loaded as `fine_tuned` from `/home/raviteja/nudiscribe/asr_checkpoints`
+- the explicit fallback path loaded as `fallback` with Whisper `base`
+- direct transcription through both runtime paths returned non-empty English transcripts for the generated sample WAV
+
+Benchmark summary used for the runtime decision:
+
+- compared `base`, `finetuned_final`, `finetuned_ckpt168`, and `finetuned_ckpt100`
+- on the known-text sample `smoke_test_artifacts/tts_rest_output.wav`, base Whisper produced the best output quality
+- the fine-tuned checkpoints loaded slightly faster and were similar or slightly faster on short synthetic inference, but they did not beat base Whisper on transcript quality
+- the offline training summary still reports weak eval quality (`eval_wer` `96.335`, `eval_cer` `64.175`), so the checkpoints do not yet justify becoming the default production path
+
+Selected runtime decision:
+
+- keep `ASR_RUNTIME_PREFER_FINETUNED=false` by default
+- keep checkpoint loading support in code for controlled comparison and future retraining passes
+- revisit the selection only after a stronger multilingual benchmark pass
 
 ## 9) Recommended Next Engineering Task
 
-Integrate runtime ASR loading of local fine-tuned model when checkpoint exists, while preserving fallback behavior to base model and existing Hindi/Kannada routing logic.
+Collect a real multilingual evaluation set with English, Hindi, Kannada, and code-mixed speech, retrain with better supervision balance, and only then revisit whether any fine-tuned checkpoint should replace base Whisper as the default runtime.

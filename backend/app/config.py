@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     asr_archive_dir: str = str(BACKEND_ROOT / "data" / "asr_corpus" / "local_archive")
     asr_checkpoint_dir: str = str(BACKEND_ROOT / "data" / "asr_checkpoints")
     asr_base_model: str = "openai/whisper-small"
-    asr_runtime_prefer_finetuned: bool = True
+    asr_runtime_prefer_finetuned: bool = False
     asr_hf_token: str = ""
     asr_target_hours_per_bucket: float = 40.0
     asr_target_code_mixed_hours: float = 20.0

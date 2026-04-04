@@ -1,26 +1,27 @@
 # Build Plan Alignment
 
-Date: 2026-04-03
+Date: 2026-04-04
 
 This document maps the current repository state to `nudiscribe_build_plan.txt`.
 
 Validation mode for this pass:
 
 - static code and documentation review
-- Ubuntu runtime validation executed in the project venv
-- backend startup verified in the current local workspace
-- the active local `.env` is configured for audio-only validation, so real-speech TTS is not exercised in this run
+- direct ASR runtime validation executed in the project venv against the local fine-tuned checkpoint
+- runtime self-check executed in the current local workspace
+- the active local `.env` keeps TTS enabled, but only tone fallback is currently available because real provider assets are not configured
 
 ## Overall Status
 
-The repository now covers the backend side of build-plan Phases 1 through 6 in code, but the current workspace is configured for audio-only validation and does not exercise TTS at startup.
+The repository now covers the backend side of build-plan Phases 1 through 6 in code. The Whisper runtime can load local fine-tuned checkpoints, but the current selected default stays on base Whisper because the available checkpoint benchmark does not yet beat the base model on quality. The current workspace still lacks a configured real-speech TTS provider.
 
 Important scope limits:
 
 - the build plan includes a frontend, but this repository is backend-only
 - the hackathon problem statement adds structured extraction, editable review, dashboards, and domain workflows that are not yet implemented here
-- Phase 5 TTS code exists, but the active local runtime keeps TTS disabled
+- Phase 5 TTS code exists, but the active local runtime currently falls back to tone output because real provider assets are not configured
 - Phase 6 now has a working SQLite-backed persistence foundation; PostgreSQL/SQLAlchemy are still future work
+- the current fine-tuned Whisper checkpoints are benchmarkable but are not yet the selected default runtime
 - Phase 7 is still pending
 
 ## Problem Statement Alignment
@@ -67,6 +68,9 @@ Build-plan intent:
 Repository status:
 
 - [x] Whisper ASR adapter exists
+- [x] runtime Whisper path can load a local fine-tuned checkpoint from `ASR_CHECKPOINT_DIR`
+- [x] runtime Whisper path can fall back to `ASR_BASE_MODEL` when checkpoint loading fails or is disabled
+- [x] base Whisper remains the selected default runtime after the current checkpoint benchmark pass
 - [x] audio upload transcription endpoint exists
 - [x] audio WebSocket endpoint exists
 - [x] manual audio test client exists
@@ -146,7 +150,7 @@ Repository status:
 - [x] merged WAV normalization exists
 - [x] runtime validation exists
 - [x] smoke-test entrypoint exists for self-check and live backend testing
-- [ ] the current local runtime is audio-only, so real-speech TTS is not exercised by default
+- [ ] the current local runtime has TTS enabled, but no real-speech provider is currently usable
 - [ ] AI4Bharat Hindi/Kannada assets are still not configured in the current workspace
 - [ ] frontend playback layer is not part of this repository
 
@@ -196,19 +200,23 @@ Repository status:
 
 - config loading now supports both repo-root `.env` and `backend/.env`
 - relative SQLite paths now resolve against the repository root, so the database stays stable regardless of launch directory
-- health output now reflects the currently available TTS providers without making audio-only validation fatal
+- Whisper runtime now supports valid local fine-tuned checkpoints while keeping base-model fallback behavior
+- `.env.example` now exposes `ASR_RUNTIME_PREFER_FINETUNED`, with base Whisper kept as the current default selection
+- health output now reflects the currently available TTS providers without making degraded local validation fatal
 - runtime validation now skips unused TTS provider diagnostics when TTS is disabled
 - product smoke-test file now exists for self-check and live backend testing
 - TTS merging now normalizes WAV format before combining segments
-- the active local runtime is configured for audio-only validation
+- runtime self-check now shows fine-tuned ASR checkpoint candidates in the settings summary
+- a local benchmark pass showed the current fine-tuned checkpoints are not yet better than base Whisper on the known-text sample
 - the backend now persists session history, transcripts, selected language, latencies, and errors to SQLite
 - several encoding-affected files were normalized to plain text
 - local-client dependency alignment was improved by listing `sounddevice` in `backend/requirements.txt`
 
 ## What Still Must Happen Next
 
-1. Add automated tests around the new persistence boundary.
+1. Add automated tests around the ASR runtime-selection path and the persistence boundary.
 2. Add the structured extractor, editable review surface, and searchable dashboard implied by the hackathon problem statement.
-3. Decide whether to keep the workspace audio-only or re-enable a real TTS provider for speech output validation.
+3. Reconfigure a real TTS provider if speech-output validation beyond tone fallback is required.
 4. Decide whether to keep SQLite for local-only use and add PostgreSQL/SQLAlchemy for fuller Phase 6 alignment.
-5. Continue with Phase 7 containerization and deployment work.
+5. Build a stronger multilingual benchmark set before reconsidering fine-tuned Whisper as the default runtime.
+6. Continue with Phase 7 containerization and deployment work.
