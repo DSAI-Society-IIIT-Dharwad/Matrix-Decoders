@@ -15,6 +15,7 @@ from .ollama_client import OllamaClient
 from .orchestrator import Orchestrator
 from .runtime_validation import collect_runtime_validation_report
 from .schemas import ChatRequest, ChatResponse, HealthResponse, TTSRequest, TTSResponse
+from .training.archive import archive_training_audio
 from .transcript_cleaner import clean_transcript
 from .tts_router import TTSSegmentInput, tts_router
 
@@ -216,6 +217,15 @@ async def transcribe_audio(file: UploadFile = File(...)):
             _elapsed_ms(started_at),
             status="ok",
             details={"filename": filename, "language": result.dominant_language},
+        )
+        archive_training_audio(
+            audio_path=temp_path,
+            text=result.text,
+            dominant_language=result.dominant_language,
+            languages=result.languages,
+            is_code_mixed=result.is_code_mixed,
+            source="api.transcribe",
+            details={"filename": filename, "content_type": file.content_type or ""},
         )
 
         return {
@@ -451,6 +461,19 @@ async def audio_ws(ws: WebSocket, session_id: str):
                     languages=transcription_event.get("languages") or [],
                     is_code_mixed=bool(transcription_event.get("is_code_mixed", False)),
                     segments=transcription_event.get("segments") or [],
+                    details={
+                        "sample_rate": audio_config.sample_rate,
+                        "channels": audio_config.channels,
+                    },
+                )
+                archive_training_audio(
+                    audio_path=temp_path,
+                    text=str(transcription_event.get("text", "")),
+                    dominant_language=transcription_event.get("language"),
+                    languages=transcription_event.get("languages") or [],
+                    is_code_mixed=bool(transcription_event.get("is_code_mixed", False)),
+                    source="ws.audio",
+                    session_id=session_id,
                     details={
                         "sample_rate": audio_config.sample_rate,
                         "channels": audio_config.channels,

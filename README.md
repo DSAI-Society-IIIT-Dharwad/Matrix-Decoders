@@ -184,7 +184,7 @@ cd backend
 pip install -r requirements.txt
 ```
 
-For AI4Bharat Indic-TTS, install the runtime and point the `.env` values at the downloaded model/config/vocoder files for Hindi and Kannada. The backend will invoke:
+For AI4Bharat Indic-TTS, install the `coqui-tts` runtime and point the `.env` values at the downloaded model/config/vocoder files for Hindi and Kannada. The backend will invoke:
 
 ```bash
 python -m TTS.bin.synthesize --text "..." --model_path ... --config_path ... --vocoder_path ... --vocoder_config_path ... --out_path ...
@@ -237,6 +237,65 @@ Optional audio/transcription coverage:
 ```bash
 python app/product_smoke_test.py --base-url http://127.0.0.1:8000 --audio-file /path/to/sample.wav
 ```
+
+## Multilingual ASR Training
+
+The repo now includes an offline ASR corpus builder and Whisper fine-tuning entrypoint at [backend/app/train_asr.py](/media/raviteja/Volume/nudiscribe/backend/app/train_asr.py). It is designed to improve the current prototype toward a lower-latency multilingual speech engine without disturbing the live inference path.
+
+The dataset inventory used by that builder is listed separately in [DATASETS.md](/media/raviteja/Volume/nudiscribe/backend/app/training/DATASETS.md) and implemented in [dataset_sources.py](/media/raviteja/Volume/nudiscribe/backend/app/training/dataset_sources.py).
+
+Session-level handoff and reproducible workflow notes are in [ASR_SESSION_WORKFLOW.md](/media/raviteja/Volume/nudiscribe/backend/app/training/ASR_SESSION_WORKFLOW.md).
+
+Reusable next-session Codex prompt is in [CODEX_CONTINUATION_PROMPT.md](/media/raviteja/Volume/nudiscribe/backend/app/training/CODEX_CONTINUATION_PROMPT.md).
+
+What it does:
+
+- pulls curated Hugging Face speech corpora for English, Hindi, and Kannada
+- normalizes audio to 16 kHz mono WAV
+- buckets samples into `english`, `hindi`, `kannada`, and `code_mixed`
+- synthesizes extra code-mixed training clips when native code-mixed coverage is thin
+- optionally archives live product audio into a weakly supervised local corpus for later continual training
+- continues Whisper fine-tuning from the latest checkpoint if one already exists
+
+Curated Hugging Face sources wired into the corpus builder:
+
+- `openslr/librispeech_asr` for large open English coverage
+- `google/fleurs` for `en_us`, `hi_in`, and `kn_in`
+- `ai4bharat/Shrutilipi` for Hindi and Kannada scale
+- `ai4bharat/Kathbath` for Hindi and Kannada train/validation coverage when gated access is approved
+
+Install the extra training dependencies from [backend/requirements.txt](/media/raviteja/Volume/nudiscribe/backend/requirements.txt), then set `ASR_HF_TOKEN` if you need gated Hugging Face datasets such as Shrutilipi or Kathbath.
+
+Build only the multilingual corpus:
+
+```bash
+cd backend
+python -m app.train_asr build-corpus --target-hours 40 --code-mixed-hours 20
+```
+
+Build the corpus and launch continual fine-tuning:
+
+```bash
+cd backend
+python -m app.train_asr full-cycle --target-hours 40 --code-mixed-hours 20 --include-weak-supervision
+```
+
+Use existing manifests for a later training round:
+
+```bash
+cd backend
+python -m app.train_asr train \
+  --train-manifest data/asr_corpus/manifests/train_all.jsonl \
+  --eval-manifest data/asr_corpus/manifests/eval_all.jsonl \
+  --include-weak-supervision
+```
+
+Generated artifacts:
+
+- bucket manifests under `backend/data/asr_corpus/manifests/train/` and `backend/data/asr_corpus/manifests/eval/`
+- consolidated manifests at `backend/data/asr_corpus/manifests/train_all.jsonl` and `backend/data/asr_corpus/manifests/eval_all.jsonl`
+- local runtime archive at `backend/data/asr_corpus/local_archive/weak_supervision.jsonl`
+- fine-tuned checkpoints under `backend/data/asr_checkpoints/`
 
 ## API Summary
 

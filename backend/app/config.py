@@ -28,6 +28,27 @@ class Settings(BaseSettings):
     # ASR settings
     whisper_model_size: str = "base"
     enable_indic_asr: bool = True
+    asr_archive_audio_for_training: bool = False
+    asr_corpus_dir: str = str(BACKEND_ROOT / "data" / "asr_corpus")
+    asr_archive_dir: str = str(BACKEND_ROOT / "data" / "asr_corpus" / "local_archive")
+    asr_checkpoint_dir: str = str(BACKEND_ROOT / "data" / "asr_checkpoints")
+    asr_base_model: str = "openai/whisper-small"
+    asr_runtime_prefer_finetuned: bool = True
+    asr_hf_token: str = ""
+    asr_target_hours_per_bucket: float = 40.0
+    asr_target_code_mixed_hours: float = 20.0
+    asr_local_archive_hours_per_bucket: float = 5.0
+    asr_eval_ratio: float = 0.1
+    asr_max_clip_seconds: float = 30.0
+    asr_train_epochs: float = 3.0
+    asr_train_learning_rate: float = 1e-5
+    asr_train_batch_size: int = 4
+    asr_eval_batch_size: int = 4
+    asr_gradient_accumulation_steps: int = 4
+    asr_logging_steps: int = 25
+    asr_save_steps: int = 500
+    asr_eval_steps: int = 500
+    asr_warmup_steps: int = 250
 
     # TTS settings
     enable_tts: bool = True
@@ -58,7 +79,13 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    @field_validator("persistence_db_path", mode="before")
+    @field_validator(
+        "persistence_db_path",
+        "asr_corpus_dir",
+        "asr_archive_dir",
+        "asr_checkpoint_dir",
+        mode="before",
+    )
     @classmethod
     def _resolve_persistence_db_path(cls, value):
         """Resolve relative database paths against the repository root."""

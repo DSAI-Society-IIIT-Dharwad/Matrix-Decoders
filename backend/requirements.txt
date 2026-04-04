@@ -1,22 +1,28 @@
+# Stable PyPI releases verified on 2026-04-03.
+
 # Core
-fastapi>=0.100.0
-uvicorn[standard]>=0.23.0
-httpx>=0.24.0
-pydantic>=2.0.0
-pydantic-settings>=2.0.0
-python-dotenv>=1.0.0
-python-multipart>=0.0.6
-orjson
-websockets
+fastapi==0.135.2
+uvicorn[standard]==0.42.0
+httpx==0.28.1
+pydantic==2.12.5
+pydantic-settings==2.13.1
+python-dotenv==1.2.2
+python-multipart==0.0.22
+orjson==3.11.7
+websockets==16.0
 
 # ASR
-openai-whisper
-torch
-torchaudio
-transformers
+openai-whisper==20250625
+torch==2.10.0
+torchaudio==2.10.0
+transformers==5.3.0
+datasets==4.7.0
+accelerate==1.13.0
+evaluate==0.4.6
+jiwer==4.0.0
 
 # TTS
-TTS
+coqui-tts==0.27.5
 
 # Test / local clients
-sounddevice
+sounddevice==0.5.5
