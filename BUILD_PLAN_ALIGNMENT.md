@@ -13,11 +13,15 @@ Validation mode for this pass:
 
 ## Overall Status
 
-The repository now covers the backend side of build-plan Phases 1 through 6 in code. The Whisper runtime can load local fine-tuned checkpoints, but the current selected default stays on base Whisper because the available checkpoint benchmark does not yet beat the base model on quality. The current workspace still lacks a configured real-speech TTS provider.
+The repository now covers build-plan Phases 1 through 6 with a working backend plus
+the first frontend integration slice under `frontend/`. The Whisper runtime can load
+local fine-tuned checkpoints, but the current selected default stays on base Whisper
+because the available checkpoint benchmark does not yet beat the base model on quality.
+The current workspace still lacks a configured real-speech TTS provider.
 
 Important scope limits:
 
-- the build plan includes a frontend, but this repository is backend-only
+- a thin frontend now exists, but the stack is still not production-ready
 - the hackathon problem statement adds structured extraction, editable review, dashboards, and domain workflows that are not yet implemented here
 - Phase 5 TTS code exists, but the active local runtime currently falls back to tone output because real provider assets are not configured
 - Phase 6 now has a working SQLite-backed persistence foundation; PostgreSQL/SQLAlchemy are still future work
@@ -26,11 +30,12 @@ Important scope limits:
 
 ## Problem Statement Alignment
 
-`IDRP_PS.pdf` describes a broader conversational intelligence system than the technical build plan alone. Current coverage is:
+`IDRP_PS.pdf` describes a broader conversational intelligence system than the technical
+build plan alone. Current coverage is:
 
-- covered: multilingual ASR for Kannada, Hindi, English, and code-mixed speech; Ollama-driven conversational backend; persisted interaction history
-- partial: live voice intake via WebSocket audio/file upload and conversational response streaming, but only as a backend pipeline
-- missing: secure in-person recording, automated outbound call handling, structured data extraction, editable review interface, searchable dashboard/history, domain-specific workflow configuration, and compliance/security hardening
+- covered: multilingual ASR for Kannada, Hindi, English, and code-mixed speech; Ollama-driven conversational backend; persisted interaction history; a frontend for text, audio upload, microphone streaming, TTS playback, editable review draft, and session history
+- partial: live voice intake, structured review, and dashboard/history now exist, but the structured extraction is still client-side heuristic logic and the current local TTS runtime is still tone fallback only
+- missing: secure in-person recording/compliance controls, automated outbound call handling, backend-owned structured extraction, domain-specific workflow configuration, and production security hardening
 
 ## Phase 1 - Core Text Pipeline
 
@@ -47,8 +52,8 @@ Repository status:
 - [x] WebSocket text chat endpoint exists
 - [x] Ollama streaming client exists
 - [x] language-aware prompt building exists
-- [ ] frontend text UI is not part of this repository
-- [ ] frontend text response display is not part of this repository
+- [x] frontend text UI exists under `frontend/`
+- [x] frontend text response display exists under `frontend/`
 
 Primary files:
 
@@ -74,7 +79,7 @@ Repository status:
 - [x] audio upload transcription endpoint exists
 - [x] audio WebSocket endpoint exists
 - [x] manual audio test client exists
-- [ ] frontend transcript display is not part of this repository
+- [x] frontend transcript display exists under `frontend/`
 
 Primary files:
 
@@ -152,7 +157,7 @@ Repository status:
 - [x] smoke-test entrypoint exists for self-check and live backend testing
 - [ ] the current local runtime has TTS enabled, but no real-speech provider is currently usable
 - [ ] AI4Bharat Hindi/Kannada assets are still not configured in the current workspace
-- [ ] frontend playback layer is not part of this repository
+- [x] frontend playback layer exists under `frontend/`
 
 Primary files:
 
@@ -178,6 +183,8 @@ Repository status:
 - [x] transcript persistence exists
 - [x] latency/error persistence exists
 - [x] relative SQLite persistence paths now resolve against the repository root
+- [x] session summary/detail retrieval endpoints now exist for the frontend dashboard
+- [x] the frontend now surfaces session history and detail records
 - [ ] PostgreSQL/SQLAlchemy are not implemented; the current persistence layer uses local SQLite
 
 Primary files:
@@ -205,6 +212,12 @@ Repository status:
 - health output now reflects the currently available TTS providers without making degraded local validation fatal
 - runtime validation now skips unused TTS provider diagnostics when TTS is disabled
 - product smoke-test file now exists for self-check and live backend testing
+- `GET /api/session/{session_id}` now exists for persisted frontend detail retrieval
+- `POST /api/transcribe` now accepts an optional `session_id`
+- a React + TypeScript + Vite frontend now exists under `frontend/`
+- the frontend connects the current REST and WebSocket endpoints without changing the backend workflow
+- the frontend build now passes `tsc -b` and `vite build`
+- in-process validation now covers root, health, session list/detail/clear, REST TTS, WebSocket TTS, WebSocket audio negotiation + commit, REST chat, and text WebSocket streaming
 - TTS merging now normalizes WAV format before combining segments
 - runtime self-check now shows fine-tuned ASR checkpoint candidates in the settings summary
 - a local benchmark pass showed the current fine-tuned checkpoints are not yet better than base Whisper on the known-text sample
@@ -214,8 +227,8 @@ Repository status:
 
 ## What Still Must Happen Next
 
-1. Add automated tests around the ASR runtime-selection path and the persistence boundary.
-2. Add the structured extractor, editable review surface, and searchable dashboard implied by the hackathon problem statement.
+1. Add automated tests around the ASR runtime-selection path, the persistence boundary, and the frontend-facing session endpoints.
+2. Replace the current client-side structured review heuristic with backend/domain-aware structured extraction.
 3. Reconfigure a real TTS provider if speech-output validation beyond tone fallback is required.
 4. Decide whether to keep SQLite for local-only use and add PostgreSQL/SQLAlchemy for fuller Phase 6 alignment.
 5. Build a stronger multilingual benchmark set before reconsidering fine-tuned Whisper as the default runtime.

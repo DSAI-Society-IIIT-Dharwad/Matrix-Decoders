@@ -80,6 +80,81 @@ class TTSResponse(BaseModel):
     audio_b64: str
 
 
+class SessionSummary(BaseModel):
+    """Summary view for a persisted session."""
+
+    session_id: str
+    created_at: str
+    updated_at: str
+    languages: List[str] = Field(default_factory=list)
+    selected_language: str = ""
+    message_count: int = 0
+    transcript_count: int = 0
+    telemetry_count: int = 0
+    last_message: str = ""
+    last_transcript: str = ""
+
+
+class SessionMessageRecord(BaseModel):
+    """Persisted session message record."""
+
+    id: int
+    role: str
+    content: str
+    created_at: str
+
+
+class SessionTranscriptRecord(BaseModel):
+    """Persisted transcript record."""
+
+    id: int
+    source: str
+    text: str
+    dominant_language: str = ""
+    languages: List[str] = Field(default_factory=list)
+    is_code_mixed: bool = False
+    segments: List[TranscriptSegment] = Field(default_factory=list)
+    details: dict = Field(default_factory=dict)
+    created_at: str
+
+
+class SessionTelemetryRecord(BaseModel):
+    """Persisted telemetry record."""
+
+    id: int
+    kind: str
+    name: str
+    status: str = ""
+    latency_ms: Optional[float] = None
+    error_message: str = ""
+    details: dict = Field(default_factory=dict)
+    created_at: str
+
+
+class SessionDetailResponse(BaseModel):
+    """Detailed persisted session snapshot."""
+
+    session_id: str
+    created_at: str
+    updated_at: str
+    languages: List[str] = Field(default_factory=list)
+    selected_language: str = ""
+    message_count: int = 0
+    transcript_count: int = 0
+    telemetry_count: int = 0
+    messages: List[SessionMessageRecord] = Field(default_factory=list)
+    transcripts: List[SessionTranscriptRecord] = Field(default_factory=list)
+    telemetry: List[SessionTelemetryRecord] = Field(default_factory=list)
+
+
+class SessionListResponse(BaseModel):
+    """List of active persisted sessions."""
+
+    sessions: List[str] = Field(default_factory=list)
+    count: int = 0
+    items: List[SessionSummary] = Field(default_factory=list)
+
+
 class OrchestratorEvent(BaseModel):
     """Streaming event from the orchestrator."""
 

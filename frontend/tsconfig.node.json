@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "skipLibCheck": true,
+    "module": "ESNext",
+    "moduleResolution": "Node",
+    "allowSyntheticDefaultImports": true,
+    "noEmit": true,
+    "tsBuildInfoFile": "/tmp/nudiscribe-frontend/tsconfig.node.tsbuildinfo"
+  },
+  "include": ["vite.config.ts"]
+}

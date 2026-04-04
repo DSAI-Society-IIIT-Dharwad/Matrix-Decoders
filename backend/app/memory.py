@@ -23,6 +23,13 @@ def _normalize_languages(languages: Optional[Iterable[str]]) -> list[str]:
     return normalized
 
 
+def _safe_json_loads(raw_value: str, fallback):
+    try:
+        return json.loads(raw_value or "")
+    except json.JSONDecodeError:
+        return fallback
+
+
 class PersistentStore:
     """SQLite-backed session store for chat history, transcripts, and telemetry."""
 
@@ -329,17 +336,188 @@ class PersistentStore:
             self._conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
         log.info(f"Cleared session '{session_id}'")
 
-    def list_sessions(self) -> List[str]:
-        """List all active session IDs."""
+    def list_session_summaries(self) -> List[dict]:
+        """Return session summaries for dashboard and history views."""
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT session_id
-                FROM sessions
-                ORDER BY updated_at DESC, session_id ASC
+                SELECT
+                    s.session_id,
+                    s.created_at,
+                    s.updated_at,
+                    s.languages_json,
+                    s.selected_language,
+                    (
+                        SELECT COUNT(*)
+                        FROM messages m
+                        WHERE m.session_id = s.session_id
+                    ) AS message_count,
+                    (
+                        SELECT COUNT(*)
+                        FROM transcripts t
+                        WHERE t.session_id = s.session_id
+                    ) AS transcript_count,
+                    (
+                        SELECT COUNT(*)
+                        FROM telemetry y
+                        WHERE y.session_id = s.session_id
+                    ) AS telemetry_count,
+                    (
+                        SELECT content
+                        FROM messages m
+                        WHERE m.session_id = s.session_id
+                        ORDER BY m.id DESC
+                        LIMIT 1
+                    ) AS last_message,
+                    (
+                        SELECT text
+                        FROM transcripts t
+                        WHERE t.session_id = s.session_id
+                        ORDER BY t.id DESC
+                        LIMIT 1
+                    ) AS last_transcript
+                FROM sessions s
+                ORDER BY s.updated_at DESC, s.session_id ASC
                 """
             ).fetchall()
-        return [str(row["session_id"]) for row in rows]
+
+        summaries: list[dict] = []
+        for row in rows:
+            summaries.append(
+                {
+                    "session_id": str(row["session_id"]),
+                    "created_at": str(row["created_at"]),
+                    "updated_at": str(row["updated_at"]),
+                    "languages": _normalize_languages(_safe_json_loads(row["languages_json"], [])),
+                    "selected_language": str(row["selected_language"] or ""),
+                    "message_count": int(row["message_count"] or 0),
+                    "transcript_count": int(row["transcript_count"] or 0),
+                    "telemetry_count": int(row["telemetry_count"] or 0),
+                    "last_message": str(row["last_message"] or ""),
+                    "last_transcript": str(row["last_transcript"] or ""),
+                }
+            )
+
+        return summaries
+
+    def list_sessions(self) -> List[str]:
+        """List all active session IDs."""
+        return [summary["session_id"] for summary in self.list_session_summaries()]
+
+    def get_session_snapshot(self, session_id: str) -> Optional[dict]:
+        """Return a full persisted snapshot for one session."""
+        with self._lock:
+            session_row = self._conn.execute(
+                """
+                SELECT session_id, created_at, updated_at, languages_json, selected_language
+                FROM sessions
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+
+            if not session_row:
+                return None
+
+            message_rows = self._conn.execute(
+                """
+                SELECT id, role, content, created_at
+                FROM messages
+                WHERE session_id = ?
+                ORDER BY id ASC
+                """,
+                (session_id,),
+            ).fetchall()
+
+            transcript_rows = self._conn.execute(
+                """
+                SELECT
+                    id,
+                    source,
+                    text,
+                    dominant_language,
+                    languages_json,
+                    is_code_mixed,
+                    segments_json,
+                    details_json,
+                    created_at
+                FROM transcripts
+                WHERE session_id = ?
+                ORDER BY id ASC
+                """,
+                (session_id,),
+            ).fetchall()
+
+            telemetry_rows = self._conn.execute(
+                """
+                SELECT
+                    id,
+                    kind,
+                    name,
+                    status,
+                    latency_ms,
+                    error_message,
+                    details_json,
+                    created_at
+                FROM telemetry
+                WHERE session_id = ?
+                ORDER BY id ASC
+                """,
+                (session_id,),
+            ).fetchall()
+
+        messages = [
+            {
+                "id": int(row["id"]),
+                "role": str(row["role"]),
+                "content": str(row["content"]),
+                "created_at": str(row["created_at"]),
+            }
+            for row in message_rows
+        ]
+
+        transcripts = [
+            {
+                "id": int(row["id"]),
+                "source": str(row["source"]),
+                "text": str(row["text"]),
+                "dominant_language": str(row["dominant_language"] or ""),
+                "languages": _normalize_languages(_safe_json_loads(row["languages_json"], [])),
+                "is_code_mixed": bool(row["is_code_mixed"]),
+                "segments": _safe_json_loads(row["segments_json"], []),
+                "details": _safe_json_loads(row["details_json"], {}),
+                "created_at": str(row["created_at"]),
+            }
+            for row in transcript_rows
+        ]
+
+        telemetry = [
+            {
+                "id": int(row["id"]),
+                "kind": str(row["kind"]),
+                "name": str(row["name"]),
+                "status": str(row["status"] or ""),
+                "latency_ms": float(row["latency_ms"]) if row["latency_ms"] is not None else None,
+                "error_message": str(row["error_message"] or ""),
+                "details": _safe_json_loads(row["details_json"], {}),
+                "created_at": str(row["created_at"]),
+            }
+            for row in telemetry_rows
+        ]
+
+        return {
+            "session_id": str(session_row["session_id"]),
+            "created_at": str(session_row["created_at"]),
+            "updated_at": str(session_row["updated_at"]),
+            "languages": _normalize_languages(_safe_json_loads(session_row["languages_json"], [])),
+            "selected_language": str(session_row["selected_language"] or ""),
+            "message_count": len(messages),
+            "transcript_count": len(transcripts),
+            "telemetry_count": len(telemetry),
+            "messages": messages,
+            "transcripts": transcripts,
+            "telemetry": telemetry,
+        }
 
     def session_count(self) -> int:
         """Return the number of active sessions."""

@@ -9,6 +9,8 @@ temp_audio/
 *.wav
 backend/data/
 backend/backend/
+frontend/node_modules/
+frontend/dist/
 
 .pytest_cache/
 .mypy_cache/

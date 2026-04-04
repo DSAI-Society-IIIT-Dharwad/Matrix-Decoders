@@ -3,7 +3,7 @@ import os
 import time
 import wave
 
-from fastapi import APIRouter, File, UploadFile, WebSocket
+from fastapi import APIRouter, File, Form, UploadFile, WebSocket
 from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
@@ -14,7 +14,15 @@ from .memory import store
 from .ollama_client import OllamaClient
 from .orchestrator import Orchestrator
 from .runtime_validation import collect_runtime_validation_report
-from .schemas import ChatRequest, ChatResponse, HealthResponse, TTSRequest, TTSResponse
+from .schemas import (
+    ChatRequest,
+    ChatResponse,
+    HealthResponse,
+    SessionDetailResponse,
+    SessionListResponse,
+    TTSRequest,
+    TTSResponse,
+)
 from .training.archive import archive_training_audio
 from .transcript_cleaner import clean_transcript
 from .tts_router import TTSSegmentInput, tts_router
@@ -165,7 +173,7 @@ async def chat(request: ChatRequest):
 
 
 @router.post("/api/transcribe")
-async def transcribe_audio(file: UploadFile = File(...)):
+async def transcribe_audio(file: UploadFile = File(...), session_id: str | None = Form(default=None)):
     """Upload an audio file and return cleaned transcript metadata."""
     log.info(f"Transcribe request: {file.filename}")
     started_at = time.perf_counter()
@@ -176,8 +184,8 @@ async def transcribe_audio(file: UploadFile = File(...)):
         message = (
             f"Unsupported audio format '{suffix}'. Expected one of {sorted(_ALLOWED_AUDIO_EXTENSIONS)}."
         )
-        store.record_error(None, "api.transcribe", message, details={"filename": filename})
-        store.record_latency(None, "api.transcribe", _elapsed_ms(started_at), status="error")
+        store.record_error(session_id, "api.transcribe", message, details={"filename": filename})
+        store.record_latency(session_id, "api.transcribe", _elapsed_ms(started_at), status="error")
         return JSONResponse(
             status_code=400,
             content={
@@ -193,8 +201,8 @@ async def transcribe_audio(file: UploadFile = File(...)):
         contents = await file.read()
         if not contents:
             message = "Uploaded audio file is empty."
-            store.record_error(None, "api.transcribe", message, details={"filename": filename})
-            store.record_latency(None, "api.transcribe", _elapsed_ms(started_at), status="error")
+            store.record_error(session_id, "api.transcribe", message, details={"filename": filename})
+            store.record_latency(session_id, "api.transcribe", _elapsed_ms(started_at), status="error")
             return JSONResponse(status_code=400, content={"error": "Uploaded audio file is empty."})
 
         with open(temp_path, "wb") as f:
@@ -202,7 +210,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
 
         result = await asr_router.transcribe_full(temp_path)
         store.record_transcript(
-            session_id=None,
+            session_id=session_id,
             source="api.transcribe",
             text=result.text,
             dominant_language=result.dominant_language,
@@ -212,7 +220,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
             details={"filename": filename, "content_type": file.content_type or ""},
         )
         store.record_latency(
-            None,
+            session_id,
             "api.transcribe",
             _elapsed_ms(started_at),
             status="ok",
@@ -225,6 +233,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
             languages=result.languages,
             is_code_mixed=result.is_code_mixed,
             source="api.transcribe",
+            session_id=session_id,
             details={"filename": filename, "content_type": file.content_type or ""},
         )
 
@@ -238,8 +247,8 @@ async def transcribe_audio(file: UploadFile = File(...)):
 
     except Exception as e:
         log.error(f"Transcription failed: {e}")
-        store.record_error(None, "api.transcribe", str(e), details={"filename": filename})
-        store.record_latency(None, "api.transcribe", _elapsed_ms(started_at), status="error")
+        store.record_error(session_id, "api.transcribe", str(e), details={"filename": filename})
+        store.record_latency(session_id, "api.transcribe", _elapsed_ms(started_at), status="error")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
     finally:
@@ -313,10 +322,20 @@ async def clear_session(session_id: str):
     return {"status": "cleared", "session_id": session_id}
 
 
-@router.get("/api/sessions")
+@router.get("/api/sessions", response_model=SessionListResponse)
 async def list_sessions():
     """List all active sessions."""
-    return {"sessions": store.list_sessions(), "count": store.session_count()}
+    items = store.list_session_summaries()
+    return {"sessions": [item["session_id"] for item in items], "count": len(items), "items": items}
+
+
+@router.get("/api/session/{session_id}", response_model=SessionDetailResponse)
+async def get_session(session_id: str):
+    """Return persisted detail for one session."""
+    snapshot = store.get_session_snapshot(session_id)
+    if not snapshot:
+        return JSONResponse(status_code=404, content={"error": "Session not found."})
+    return snapshot
 
 
 @router.websocket("/ws/{session_id}")

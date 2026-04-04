@@ -59,19 +59,19 @@ Core modules in the current implementation:
 
 ## Current Status
 
-NudiScribe is currently at an early backend MVP or prototype stage.
+NudiScribe is currently at an early full-stack MVP or prototype stage.
 
 What is already in place:
 
 - the backend architecture is implemented end-to-end
 - the main API surface is usable
 - the multilingual and code-mixed handling logic is present
+- a React + TypeScript frontend now exists for chat, live audio, TTS, structured review, and session history
 - the service is structured clearly enough for further iteration
 - the source code has been organized into focused modules
 
 What is not yet complete:
 
-- no frontend application is included
 - the persistence layer currently targets a local SQLite database for development, not a production PostgreSQL deployment
 - no authentication or access control exists
 - no automated test suite is present
@@ -346,8 +346,8 @@ The next phase of development should focus on moving from prototype to reliable 
 
 ### Product and Platform Work
 
-- build a frontend interface for chat and voice interaction
-- add structured extraction, editable review, and dashboard surfaces from the hackathon problem statement
+- deepen the frontend interface for chat and voice interaction with browser-level tests and UX hardening
+- replace the current client-side structured review draft with backend/domain-aware extraction and stronger dashboard/reporting behavior
 - add user authentication and authorization
 - introduce configuration profiles for local, staging, and production
 - containerize the backend with Docker

@@ -101,6 +101,14 @@ The intended runtime flow is:
   manual audio WebSocket test client
 - [backend/app/tts_test_client.py](/media/raviteja/Volume/nudiscribe/backend/app/tts_test_client.py)
   manual TTS WebSocket test client
+- [frontend/src/App.tsx](/media/raviteja/Volume/nudiscribe/frontend/src/App.tsx)
+  operator frontend wired to the current REST and WebSocket contracts
+- [frontend/src/api.ts](/media/raviteja/Volume/nudiscribe/frontend/src/api.ts)
+  typed REST and WebSocket client layer for the frontend
+- [frontend/src/audio.ts](/media/raviteja/Volume/nudiscribe/frontend/src/audio.ts)
+  AudioWorklet-based raw PCM microphone capture that mirrors `audio_test_client.py`
+- [frontend/src/extraction.ts](/media/raviteja/Volume/nudiscribe/frontend/src/extraction.ts)
+  client-side structured review draft helpers for healthcare and financial/survey modes
 
 These support files are not part of the backend runtime path, but they are still useful for validation and should be kept.
 
@@ -114,6 +122,11 @@ Changes made:
 - extended [backend/app/runtime_validation.py](/media/raviteja/Volume/nudiscribe/backend/app/runtime_validation.py) so self-check output shows ASR checkpoint candidates and runtime preference settings
 - benchmarked the currently available checkpoints and kept base Whisper as the default runtime because the available fine-tuned outputs did not beat it on the known-text sample
 - avoided repeated TTS provider list computation in the health endpoint
+- added `GET /api/session/{session_id}` so the frontend can load persisted session detail
+- updated `POST /api/transcribe` so upload transcription can attach to the active `session_id`
+- built the first frontend under [frontend/](/media/raviteja/Volume/nudiscribe/frontend/) with command-center, text/audio/TTS workspace, editable review, history dashboard, and outbound placeholder surfaces
+- matched the browser microphone flow to [backend/app/audio_test_client.py](/media/raviteja/Volume/nudiscribe/backend/app/audio_test_client.py): raw `pcm_s16le`, mono, negotiated config, chunked streaming, and explicit `commit`
+- validated the current surface with backend `py_compile`, runtime self-check, frontend TypeScript build, Vite production build, and in-process REST/WebSocket endpoint checks
 - added [backend/backend/](/media/raviteja/Volume/nudiscribe/backend/backend/) to `.gitignore` because it is a stale duplicate persistence path from an older relative-path bug
 - updated [README.md](/media/raviteja/Volume/nudiscribe/README.md) so the roadmap reflects the current implementation instead of older prototype assumptions
 
@@ -139,8 +152,8 @@ Completed:
 
 Remaining:
 
-- actual frontend text UI
-- frontend response display
+- automated browser tests around the live text loop
+- UX hardening and accessibility polish
 
 ### Phase 2 - Speech input with Whisper
 
@@ -155,7 +168,6 @@ Completed:
 
 Remaining:
 
-- browser/client capture UI
 - more robust live-audio protocol testing
 - collect a stronger multilingual benchmark set before reconsidering fine-tuned checkpoints as the default runtime
 
@@ -198,7 +210,7 @@ Remaining:
 
 - configure real AI4Bharat Hindi/Kannada assets in the active workspace
 - restore or validate a real speech provider in the current runtime if production-like speech output is required
-- build frontend playback controls
+- improve frontend playback handling once a real-speech provider is active
 
 ### Phase 6 - Persistence
 
@@ -213,30 +225,31 @@ Remaining:
 
 - automated tests around persistence
 - decide whether to keep SQLite as local-dev storage only
-- add retrieval/reporting surfaces only where the product actually needs them
+- deepen dashboard/search/reporting beyond the current session summary and detail views
 
 ### Phase 7 - Frontend integration
 
-Recommended next execution target:
+Completed slice:
 
-- build a thin frontend against the current backend
-- support text chat, transcript display, audio upload or microphone capture, and TTS playback
-- do not add structured extraction or dashboard complexity until this loop is working end to end
+- built a thin frontend against the current backend
+- connected text chat, transcript display, audio upload, microphone capture, TTS playback, session management, and health/status views
+- added a session dashboard and editable structured review draft without changing the backend workflow contract
+- validated the frontend against the live endpoint contract and the audio-test-client PCM workflow
 
 ### Phase 8 - Product-specific features from the problem statement
 
 Add after the thin frontend exists, one slice at a time:
 
-- structured extractor
-- editable review interface
-- searchable history and dashboard views
+- backend-owned structured extractor
+- stronger editable review workflow with save/export/backfill behavior
+- richer searchable history and analytics views
 - domain-specific workflow configuration
 - auth, compliance, CI, observability, and deployment
 
 ## Remaining High-Priority Work
 
 1. keep the backend stable around the current workflow contract
-2. build the thin frontend on top of the existing REST and WebSocket endpoints
-3. add tests for `memory.py`, ASR routing, transcript cleanup, and the TTS router
-4. add tests for runtime Whisper checkpoint selection and fallback behavior
-5. turn the hackathon-only feature set into explicit vertical slices instead of a single large catch-up phase
+2. add automated tests for `memory.py`, ASR routing, transcript cleanup, the TTS router, and the new frontend-facing session endpoints
+3. add tests for runtime Whisper checkpoint selection and fallback behavior
+4. replace the client-side structured review heuristic with backend/domain-aware extraction
+5. re-enable a real TTS provider if production-like speech output is required
