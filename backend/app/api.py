@@ -1,7 +1,11 @@
+from __future__ import annotations
+
 import json
 import os
+import tempfile
 import time
 import wave
+from pathlib import Path
 
 from fastapi import APIRouter, File, Form, UploadFile, WebSocket
 from fastapi.responses import JSONResponse
@@ -9,6 +13,15 @@ from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from .asr.router import ASRRouter
 from .audio_utils import AudioFormatConfig, trim_pcm16_silence
+from .consultation import (
+    build_opening_assistant_prompt,
+    derive_consultation_snapshot,
+    infer_speaker_role,
+    normalize_consultation_mode,
+)
+from .document_parser import SUPPORTED_REPORT_SUFFIXES, extract_document_text
+from .dynamic_extract import extract_dynamic_json
+from .healthcare_resources import select_healthcare_resources
 from .logger import get_logger
 from .memory import store
 from .ollama_client import OllamaClient
@@ -17,11 +30,16 @@ from .runtime_validation import collect_runtime_validation_report
 from .schemas import (
     ChatRequest,
     ChatResponse,
+    DynamicExtractRequest,
+    DynamicExtractResponse,
     HealthResponse,
+    ReportExtractResponse,
     SessionDetailResponse,
     SessionListResponse,
+    StartConsultationRequest,
     TTSRequest,
     TTSResponse,
+    TranscribeResponse,
 )
 from .training.archive import archive_training_audio
 from .transcript_cleaner import clean_transcript
@@ -85,9 +103,16 @@ def _build_tts_segment_inputs(
     ]
 
 
+def _augment_session_snapshot(snapshot: dict | None) -> dict | None:
+    if not snapshot:
+        return snapshot
+    consultation = derive_consultation_snapshot(snapshot)
+    snapshot.update(consultation)
+    return snapshot
+
+
 @router.get("/api/health", response_model=HealthResponse)
 async def health_check():
-    """Health check with model status and uptime."""
     ollama_ok = await ollama_client.is_available()
     validation_report = collect_runtime_validation_report(run_command_probes=False)
     available_tts_providers = tts_router.available_providers()
@@ -95,9 +120,7 @@ async def health_check():
     tts_ready = bool(available_tts_providers)
     tts_real_ready = bool(available_real_tts_providers)
     health_status = "ok"
-    if not ollama_ok or (
-        bool(validation_report.settings_summary["enable_tts"]) and not tts_ready
-    ):
+    if not ollama_ok or (bool(validation_report.settings_summary["enable_tts"]) and not tts_ready):
         health_status = "degraded"
 
     return HealthResponse(
@@ -115,156 +138,300 @@ async def health_check():
     )
 
 
+@router.post("/api/consultation/start", response_model=ChatResponse)
+async def start_consultation(request: StartConsultationRequest):
+    consultation_mode = normalize_consultation_mode(request.consultation_mode)
+    opening_prompt = build_opening_assistant_prompt(consultation_mode)
+    store.add(request.session_id, "assistant", opening_prompt)
+    snapshot = _augment_session_snapshot(store.get_session_snapshot(request.session_id)) or {}
+    return ChatResponse(
+        text=opening_prompt,
+        language="en",
+        languages=list(snapshot.get("languages", ["en"])),
+        is_code_mixed=False,
+        session_id=request.session_id,
+        speaker_role="assistant",
+        consultation_mode=consultation_mode,
+        structured_report=snapshot.get("structured_report", {}),
+        knowledge_hits=snapshot.get("knowledge_hits", []),
+        suggested_questions=snapshot.get("suggested_questions", []),
+    )
+
+
 @router.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """Text chat endpoint with language-aware validation."""
     started_at = time.perf_counter()
     cleaned_text = clean_transcript(request.text)
     if not cleaned_text:
         message = "Text input cannot be empty."
         store.record_error(request.session_id, "api.chat", message)
         store.record_latency(request.session_id, "api.chat", _elapsed_ms(started_at), status="error")
-        return JSONResponse(status_code=400, content={"error": "Text input cannot be empty."})
-
-    log.info(f"Chat request [{request.session_id}]: '{cleaned_text[:60]}...'")
+        return JSONResponse(status_code=400, content={"error": message})
 
     response_text = ""
-    language = "en"
-    languages = []
-    is_code_mixed = False
+    final_event = None
+    pipeline_error = None
 
-    async for event in orch.process(request.session_id, cleaned_text):
+    async for event in orch.process(
+        request.session_id,
+        cleaned_text,
+        speaker_role_hint=request.speaker_role,
+        consultation_mode=request.consultation_mode,
+    ):
         if event["type"] == "delta":
             response_text += event["text"]
         elif event["type"] == "final":
-            language = event.get("language", "en")
-            languages = event.get("languages", [])
-            is_code_mixed = event.get("is_code_mixed", False)
+            final_event = event
         elif event["type"] == "error":
-            store.record_error(request.session_id, "api.chat", event["error"])
-            store.record_latency(
-                request.session_id,
-                "api.chat",
-                _elapsed_ms(started_at),
-                status="error",
-                details={"input_length": len(cleaned_text)},
-            )
-            return JSONResponse(status_code=500, content={"error": event["error"]})
+            pipeline_error = event["error"]
 
-    if languages:
-        store.track_languages(request.session_id, set(languages))
-    if language:
-        store.set_selected_language(request.session_id, language)
+    if pipeline_error:
+        store.record_error(request.session_id, "api.chat", pipeline_error)
+        store.record_latency(request.session_id, "api.chat", _elapsed_ms(started_at), status="error")
+        return JSONResponse(status_code=500, content={"error": pipeline_error})
+
+    final_event = final_event or {}
+    if final_event.get("languages"):
+        store.track_languages(request.session_id, set(final_event["languages"]))
+    if final_event.get("language"):
+        store.set_selected_language(request.session_id, final_event["language"])
     store.record_latency(
         request.session_id,
         "api.chat",
         _elapsed_ms(started_at),
         status="ok",
-        details={"response_language": language, "is_code_mixed": is_code_mixed},
+        details={
+            "response_language": final_event.get("language", ""),
+            "speaker_role": final_event.get("speaker_role", ""),
+            "consultation_mode": final_event.get("consultation_mode", ""),
+        },
     )
 
     return ChatResponse(
         text=response_text,
-        language=language,
-        languages=languages,
-        is_code_mixed=is_code_mixed,
+        language=final_event.get("language", "en"),
+        languages=final_event.get("languages", []),
+        is_code_mixed=bool(final_event.get("is_code_mixed", False)),
         session_id=request.session_id,
+        speaker_role=final_event.get("speaker_role", "patient"),
+        consultation_mode=final_event.get("consultation_mode", normalize_consultation_mode(request.consultation_mode)),
+        structured_report=final_event.get("structured_report", {}),
+        knowledge_hits=final_event.get("knowledge_hits", []),
+        suggested_questions=final_event.get("suggested_questions", []),
     )
 
 
-@router.post("/api/transcribe")
+@router.post("/api/transcribe", response_model=TranscribeResponse)
 async def transcribe_audio(file: UploadFile = File(...), session_id: str | None = Form(default=None)):
-    """Upload an audio file and return cleaned transcript metadata."""
-    log.info(f"Transcribe request: {file.filename}")
     started_at = time.perf_counter()
-    filename = file.filename or ""
-
-    suffix = os.path.splitext(filename)[1].lower()
+    filename = file.filename or "upload.wav"
+    suffix = Path(filename).suffix.lower()
     if suffix and suffix not in _ALLOWED_AUDIO_EXTENSIONS:
-        message = (
-            f"Unsupported audio format '{suffix}'. Expected one of {sorted(_ALLOWED_AUDIO_EXTENSIONS)}."
-        )
-        store.record_error(session_id, "api.transcribe", message, details={"filename": filename})
-        store.record_latency(session_id, "api.transcribe", _elapsed_ms(started_at), status="error")
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error": message
-            },
-        )
+        message = f"Unsupported audio format '{suffix}'. Expected one of {sorted(_ALLOWED_AUDIO_EXTENSIONS)}."
+        return JSONResponse(status_code=400, content={"error": message})
 
-    os.makedirs("temp_audio", exist_ok=True)
-    temp_suffix = suffix or ".wav"
-    temp_path = f"temp_audio/upload_{int(time.time())}{temp_suffix}"
+    temp_dir = Path("temp_audio")
+    temp_dir.mkdir(exist_ok=True)
+    temp_path = temp_dir / f"upload_{int(time.time() * 1000)}{suffix or '.wav'}"
 
     try:
         contents = await file.read()
         if not contents:
-            message = "Uploaded audio file is empty."
-            store.record_error(session_id, "api.transcribe", message, details={"filename": filename})
-            store.record_latency(session_id, "api.transcribe", _elapsed_ms(started_at), status="error")
             return JSONResponse(status_code=400, content={"error": "Uploaded audio file is empty."})
 
-        with open(temp_path, "wb") as f:
-            f.write(contents)
+        temp_path.write_bytes(contents)
+        result = await asr_router.transcribe_full(str(temp_path))
+        history = store.get(session_id) if session_id else []
+        speaker_role = infer_speaker_role(result.text, history)
 
-        result = await asr_router.transcribe_full(temp_path)
-        store.record_transcript(
-            session_id=session_id,
-            source="api.transcribe",
-            text=result.text,
-            dominant_language=result.dominant_language,
-            languages=result.languages,
-            is_code_mixed=result.is_code_mixed,
-            segments=result.segments,
-            details={"filename": filename, "content_type": file.content_type or ""},
-        )
+        if session_id:
+            store.record_transcript(
+                session_id=session_id,
+                source="api.transcribe",
+                text=result.text,
+                dominant_language=result.dominant_language,
+                languages=result.languages,
+                is_code_mixed=result.is_code_mixed,
+                segments=result.segments,
+                details={
+                    "filename": filename,
+                    "content_type": file.content_type or "",
+                    "speaker_role": speaker_role,
+                },
+            )
+            archive_training_audio(
+                audio_path=str(temp_path),
+                text=result.text,
+                dominant_language=result.dominant_language,
+                languages=result.languages,
+                is_code_mixed=result.is_code_mixed,
+                source="api.transcribe",
+                session_id=session_id,
+                details={"filename": filename, "speaker_role": speaker_role},
+            )
+
+        snapshot = _augment_session_snapshot(store.get_session_snapshot(session_id)) if session_id else None
         store.record_latency(
             session_id,
             "api.transcribe",
             _elapsed_ms(started_at),
             status="ok",
-            details={"filename": filename, "language": result.dominant_language},
+            details={"filename": filename, "speaker_role": speaker_role},
         )
-        archive_training_audio(
-            audio_path=temp_path,
+        return TranscribeResponse(
             text=result.text,
-            dominant_language=result.dominant_language,
-            languages=result.languages,
+            language=result.dominant_language,
+            languages=list(result.languages),
             is_code_mixed=result.is_code_mixed,
-            source="api.transcribe",
-            session_id=session_id,
-            details={"filename": filename, "content_type": file.content_type or ""},
+            segments=result.segments,
+            speaker_role=speaker_role,
+            structured_report=(snapshot or {}).get("structured_report", {}),
+            knowledge_hits=(snapshot or {}).get("knowledge_hits", select_healthcare_resources([result.text])),
+            suggested_questions=(snapshot or {}).get("suggested_questions", []),
+        )
+    except Exception as exc:
+        log.error(f"Transcription failed: {exc}")
+        store.record_error(session_id, "api.transcribe", str(exc), details={"filename": filename})
+        store.record_latency(session_id, "api.transcribe", _elapsed_ms(started_at), status="error")
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+@router.post("/api/extract/dynamic", response_model=DynamicExtractResponse)
+async def dynamic_extract(request: DynamicExtractRequest):
+    started_at = time.perf_counter()
+    cleaned_text = clean_transcript(request.text)
+    if not cleaned_text:
+        return JSONResponse(status_code=400, content={"error": "Dynamic extraction input cannot be empty."})
+
+    try:
+        result = await extract_dynamic_json(
+            cleaned_text,
+            request.schema,
+            context=clean_transcript(request.context),
+        )
+    except Exception as exc:
+        session_id = request.session_id if request.session_id else None
+        store.record_error(session_id, "api.extract.dynamic", str(exc))
+        store.record_latency(session_id, "api.extract.dynamic", _elapsed_ms(started_at), status="error")
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+    session_id = request.session_id if request.session_id else None
+    store.record_latency(
+        session_id,
+        "api.extract.dynamic",
+        _elapsed_ms(started_at),
+        status="ok",
+        details={
+            "used_llm": result.used_llm,
+            "fallback_used": result.fallback_used,
+            "issues": len(result.issues),
+        },
+    )
+    return DynamicExtractResponse(
+        result=result.result,
+        normalized_schema=result.normalized_schema,
+        issues=result.issues,
+        used_llm=result.used_llm,
+        fallback_used=result.fallback_used,
+    )
+
+
+@router.post("/api/report/extract", response_model=ReportExtractResponse)
+async def extract_report(
+    file: UploadFile = File(...),
+    session_id: str | None = Form(default=None),
+    schema_json: str | None = Form(default=None),
+):
+    filename = file.filename or "report"
+    suffix = Path(filename).suffix.lower()
+    if suffix not in SUPPORTED_REPORT_SUFFIXES:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"Unsupported report format '{suffix or 'unknown'}'."},
         )
 
-        return {
-            "text": result.text,
-            "language": result.dominant_language,
-            "languages": list(result.languages),
-            "is_code_mixed": result.is_code_mixed,
-            "segments": result.segments,
-        }
+    tmp_handle = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp_path = Path(tmp_handle.name)
+    tmp_handle.close()
 
-    except Exception as e:
-        log.error(f"Transcription failed: {e}")
-        store.record_error(session_id, "api.transcribe", str(e), details={"filename": filename})
-        store.record_latency(session_id, "api.transcribe", _elapsed_ms(started_at), status="error")
-        return JSONResponse(status_code=500, content={"error": str(e)})
+    try:
+        tmp_path.write_bytes(await file.read())
+        extracted_text = extract_document_text(str(tmp_path))
+        knowledge_hits = select_healthcare_resources([extracted_text])
+        document_record = {"role": "document", "content": extracted_text}
+        structured_report = derive_consultation_snapshot(
+            {
+                "messages": [document_record],
+                "transcripts": [],
+            }
+        )["structured_report"]
+        dynamic_json: dict[str, object] = {}
+        dynamic_issues: list[str] = []
+        dynamic_used_llm = False
+        dynamic_fallback_used = False
 
+        if schema_json and schema_json.strip():
+            try:
+                parsed_schema = json.loads(schema_json)
+            except json.JSONDecodeError:
+                return JSONResponse(status_code=400, content={"error": "schema_json must be valid JSON."})
+
+            if not isinstance(parsed_schema, dict):
+                return JSONResponse(status_code=400, content={"error": "schema_json must be a JSON object schema."})
+
+            dynamic_result = await extract_dynamic_json(
+                extracted_text,
+                parsed_schema,
+                context="Extract fields from uploaded healthcare report text.",
+            )
+            dynamic_json = dict(dynamic_result.result)
+            dynamic_issues = list(dynamic_result.issues)
+            dynamic_used_llm = dynamic_result.used_llm
+            dynamic_fallback_used = dynamic_result.fallback_used
+
+        if session_id:
+            store.record_transcript(
+                session_id=session_id,
+                source="report.upload",
+                text=extracted_text,
+                dominant_language="en",
+                languages=["en"],
+                is_code_mixed=False,
+                segments=[],
+                details={
+                    "filename": filename,
+                    "structured_report": structured_report,
+                    "dynamic_json": dynamic_json,
+                    "dynamic_issues": dynamic_issues,
+                },
+            )
+
+        return ReportExtractResponse(
+            filename=filename,
+            text=extracted_text,
+            structured_report=structured_report,
+            knowledge_hits=knowledge_hits,
+            dynamic_json=dynamic_json,
+            dynamic_issues=dynamic_issues,
+            dynamic_used_llm=dynamic_used_llm,
+            dynamic_fallback_used=dynamic_fallback_used,
+        )
+    except Exception as exc:
+        log.error(f"Report extraction failed: {exc}")
+        return JSONResponse(status_code=500, content={"error": str(exc)})
     finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 @router.post("/api/tts", response_model=TTSResponse)
 async def synthesize_speech(request: TTSRequest):
-    """Synthesize speech for the provided text."""
     started_at = time.perf_counter()
     cleaned_text = clean_transcript(request.text)
     if not cleaned_text:
-        message = "TTS input cannot be empty."
-        store.record_error(None, "api.tts", message)
-        store.record_latency(None, "api.tts", _elapsed_ms(started_at), status="error")
         return JSONResponse(status_code=400, content={"error": "TTS input cannot be empty."})
 
     try:
@@ -279,19 +446,10 @@ async def synthesize_speech(request: TTSRequest):
             languages=request.languages,
             preferred_language=request.language,
         )
-    except ValueError as e:
-        store.record_error(None, "api.tts", str(e))
+    except Exception as exc:
+        store.record_error(None, "api.tts", str(exc))
         store.record_latency(None, "api.tts", _elapsed_ms(started_at), status="error")
-        return JSONResponse(status_code=400, content={"error": str(e)})
-    except RuntimeError as e:
-        store.record_error(None, "api.tts", str(e))
-        store.record_latency(None, "api.tts", _elapsed_ms(started_at), status="error")
-        return JSONResponse(status_code=503, content={"error": str(e)})
-    except Exception as e:
-        log.error(f"TTS synthesis failed: {e}")
-        store.record_error(None, "api.tts", str(e))
-        store.record_latency(None, "api.tts", _elapsed_ms(started_at), status="error")
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return JSONResponse(status_code=500, content={"error": str(exc)})
 
     store.record_latency(
         None,
@@ -304,7 +462,6 @@ async def synthesize_speech(request: TTSRequest):
             "segment_count": len(result.segments),
         },
     )
-
     return TTSResponse(
         text=result.text,
         language=result.language,
@@ -317,22 +474,19 @@ async def synthesize_speech(request: TTSRequest):
 
 @router.delete("/api/session/{session_id}")
 async def clear_session(session_id: str):
-    """Clear conversation history for a session."""
     store.clear(session_id)
     return {"status": "cleared", "session_id": session_id}
 
 
 @router.get("/api/sessions", response_model=SessionListResponse)
 async def list_sessions():
-    """List all active sessions."""
     items = store.list_session_summaries()
     return {"sessions": [item["session_id"] for item in items], "count": len(items), "items": items}
 
 
 @router.get("/api/session/{session_id}", response_model=SessionDetailResponse)
 async def get_session(session_id: str):
-    """Return persisted detail for one session."""
-    snapshot = store.get_session_snapshot(session_id)
+    snapshot = _augment_session_snapshot(store.get_session_snapshot(session_id))
     if not snapshot:
         return JSONResponse(status_code=404, content={"error": "Session not found."})
     return snapshot
@@ -340,9 +494,8 @@ async def get_session(session_id: str):
 
 @router.websocket("/ws/{session_id}")
 async def text_ws(ws: WebSocket, session_id: str):
-    """WebSocket endpoint for streaming text chat."""
     await ws.accept()
-    log.info(f"WebSocket connected: session={session_id}")
+    log.info(f"Text consultation WebSocket connected: session={session_id}")
 
     try:
         while True:
@@ -352,30 +505,31 @@ async def text_ws(ws: WebSocket, session_id: str):
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
-                store.record_error(session_id, "ws.text", "Invalid JSON")
-                store.record_latency(session_id, "ws.text", _elapsed_ms(started_at), status="error")
                 await ws.send_json({"type": "error", "error": "Invalid JSON"})
                 continue
 
+            if msg.get("type") != "input":
+                await ws.send_json({"type": "error", "error": "Expected {type: 'input', text: '...'}"})
+                continue
+
             cleaned_text = clean_transcript(msg.get("text", ""))
-            if msg.get("type") != "input" or not cleaned_text:
-                message = "Expected {type: 'input', text: '...'}"
-                store.record_error(session_id, "ws.text", message)
-                store.record_latency(session_id, "ws.text", _elapsed_ms(started_at), status="error")
-                await ws.send_json(
-                    {"type": "error", "error": message}
-                )
+            if not cleaned_text:
+                await ws.send_json({"type": "error", "error": "Text input cannot be empty."})
                 continue
 
             final_event = None
             pipeline_error = None
-            async for event in orch.process(session_id, cleaned_text):
-                if ws.client_state == WebSocketState.CONNECTED:
-                    await ws.send_json(event)
+            async for event in orch.process(
+                session_id,
+                cleaned_text,
+                speaker_role_hint=msg.get("speaker_role"),
+                consultation_mode=msg.get("consultation_mode", "consultation"),
+            ):
+                await ws.send_json(event)
                 if event["type"] == "final":
                     final_event = event
                 elif event["type"] == "error":
-                    pipeline_error = event.get("error", "Unknown text WebSocket error")
+                    pipeline_error = event.get("error", "Unknown text websocket error")
 
             latency_ms = _elapsed_ms(started_at)
             if pipeline_error:
@@ -384,46 +538,39 @@ async def text_ws(ws: WebSocket, session_id: str):
                 continue
 
             if final_event:
-                final_languages = final_event.get("languages") or []
-                if final_languages:
-                    store.track_languages(session_id, set(final_languages))
-                if final_event.get("language"):
-                    store.set_selected_language(session_id, final_event["language"])
                 store.record_latency(
                     session_id,
                     "ws.text",
                     latency_ms,
                     status="ok",
                     details={
-                        "response_language": final_event.get("language", ""),
-                        "is_code_mixed": bool(final_event.get("is_code_mixed", False)),
+                        "speaker_role": final_event.get("speaker_role", ""),
+                        "consultation_mode": final_event.get("consultation_mode", ""),
                     },
                 )
-
     except WebSocketDisconnect:
-        log.info(f"WebSocket disconnected: session={session_id}")
-    except Exception as e:
-        log.error(f"WebSocket error [{session_id}]: {e}")
-        store.record_error(session_id, "ws.text", str(e))
+        log.info(f"Text consultation WebSocket disconnected: session={session_id}")
+    except Exception as exc:
+        log.error(f"Text consultation WebSocket error [{session_id}]: {exc}")
         try:
             if ws.client_state == WebSocketState.CONNECTED:
-                await ws.send_json({"type": "error", "error": str(e)})
-                await ws.close(code=1011, reason=str(e))
+                await ws.send_json({"type": "error", "error": str(exc)})
+                await ws.close(code=1011, reason=str(exc))
         except Exception:
             pass
 
 
 @router.websocket("/ws/audio/{session_id}")
 async def audio_ws(ws: WebSocket, session_id: str):
-    """WebSocket endpoint for streaming 16-bit PCM audio."""
     await ws.accept()
-    log.info(f"Audio WebSocket connected: session={session_id}")
+    log.info(f"Audio consultation WebSocket connected: session={session_id}")
 
     audio_buffer = bytearray()
     audio_config = AudioFormatConfig()
     last_audio_time = time.time()
     commit_driven_mode = False
-
+    consultation_mode = "consultation"
+    speaker_role_hint = None
     silence_timeout = 1.2
 
     async def flush_audio_buffer():
@@ -434,23 +581,17 @@ async def audio_ws(ws: WebSocket, session_id: str):
 
         pcm_audio = trim_pcm16_silence(bytes(audio_buffer), channels=audio_config.channels)
         audio_buffer.clear()
-
         if not pcm_audio:
-            if ws.client_state == WebSocketState.CONNECTED:
-                await ws.send_json({"type": "audio_skipped", "reason": "silence"})
+            await ws.send_json({"type": "audio_skipped", "reason": "silence"})
             return
 
-        log.info(
-            "Processing audio "
-            f"({len(pcm_audio)} bytes, {audio_config.sample_rate}Hz, {audio_config.channels}ch)..."
-        )
+        temp_dir = Path("temp_audio")
+        temp_dir.mkdir(exist_ok=True)
+        temp_path = temp_dir / f"{session_id}_{int(time.time() * 1000)}.wav"
         started_at = time.perf_counter()
 
-        os.makedirs("temp_audio", exist_ok=True)
-        temp_path = f"temp_audio/{session_id}_{int(time.time())}.wav"
-
         try:
-            with wave.open(temp_path, "wb") as wf:
+            with wave.open(str(temp_path), "wb") as wf:
                 wf.setnchannels(audio_config.channels)
                 wf.setsampwidth(audio_config.sample_width)
                 wf.setframerate(audio_config.sample_rate)
@@ -460,16 +601,19 @@ async def audio_ws(ws: WebSocket, session_id: str):
             final_event = None
             pipeline_error = None
 
-            async for event in orch.process_audio(session_id, temp_path):
+            async for event in orch.process_audio(
+                session_id,
+                str(temp_path),
+                consultation_mode=consultation_mode,
+                speaker_role_hint=speaker_role_hint,
+            ):
                 if event["type"] == "transcription":
                     transcription_event = event
                 elif event["type"] == "final":
                     final_event = event
                 elif event["type"] == "error":
                     pipeline_error = event.get("error", "Unknown audio pipeline error")
-
-                if ws.client_state == WebSocketState.CONNECTED:
-                    await ws.send_json(event)
+                await ws.send_json(event)
 
             if transcription_event:
                 store.record_transcript(
@@ -483,128 +627,62 @@ async def audio_ws(ws: WebSocket, session_id: str):
                     details={
                         "sample_rate": audio_config.sample_rate,
                         "channels": audio_config.channels,
+                        "speaker_role": transcription_event.get("speaker_role", ""),
+                        "consultation_mode": consultation_mode,
                     },
                 )
                 archive_training_audio(
-                    audio_path=temp_path,
+                    audio_path=str(temp_path),
                     text=str(transcription_event.get("text", "")),
                     dominant_language=transcription_event.get("language"),
                     languages=transcription_event.get("languages") or [],
                     is_code_mixed=bool(transcription_event.get("is_code_mixed", False)),
                     source="ws.audio",
                     session_id=session_id,
-                    details={
-                        "sample_rate": audio_config.sample_rate,
-                        "channels": audio_config.channels,
-                    },
+                    details={"speaker_role": transcription_event.get("speaker_role", "")},
                 )
 
             latency_ms = _elapsed_ms(started_at)
             if pipeline_error:
-                store.record_error(
-                    session_id,
-                    "ws.audio",
-                    pipeline_error,
-                    details={
-                        "sample_rate": audio_config.sample_rate,
-                        "channels": audio_config.channels,
-                    },
-                )
-                store.record_latency(
-                    session_id,
-                    "ws.audio",
-                    latency_ms,
-                    status="error",
-                    details={
-                        "sample_rate": audio_config.sample_rate,
-                        "channels": audio_config.channels,
-                    },
-                )
+                store.record_error(session_id, "ws.audio", pipeline_error)
+                store.record_latency(session_id, "ws.audio", latency_ms, status="error")
             elif final_event:
-                final_languages = final_event.get("languages") or []
-                if final_languages:
-                    store.track_languages(session_id, set(final_languages))
-                if final_event.get("language"):
-                    store.set_selected_language(session_id, final_event["language"])
                 store.record_latency(
                     session_id,
                     "ws.audio",
                     latency_ms,
                     status="ok",
                     details={
-                        "sample_rate": audio_config.sample_rate,
-                        "channels": audio_config.channels,
-                        "transcript_language": (
-                            transcription_event.get("language", "") if transcription_event else ""
-                        ),
+                        "speaker_role": final_event.get("speaker_role", ""),
+                        "consultation_mode": final_event.get("consultation_mode", ""),
                     },
                 )
-
-        except Exception as e:
-            log.error(f"Audio processing error: {e}")
-            store.record_error(
-                session_id,
-                "ws.audio",
-                str(e),
-                details={"sample_rate": audio_config.sample_rate, "channels": audio_config.channels},
-            )
-            store.record_latency(
-                session_id,
-                "ws.audio",
-                _elapsed_ms(started_at),
-                status="error",
-                details={"sample_rate": audio_config.sample_rate, "channels": audio_config.channels},
-            )
-            if ws.client_state == WebSocketState.CONNECTED:
-                await ws.send_json({"type": "error", "error": str(e)})
-
+        except Exception as exc:
+            log.error(f"Audio processing error: {exc}")
+            store.record_error(session_id, "ws.audio", str(exc))
+            store.record_latency(session_id, "ws.audio", _elapsed_ms(started_at), status="error")
+            await ws.send_json({"type": "error", "error": str(exc)})
         finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+            if temp_path.exists():
+                temp_path.unlink()
 
     try:
         while True:
-            try:
-                data = await ws.receive()
-            except WebSocketDisconnect:
-                log.info(f"Audio client disconnected: session={session_id}")
-                break
-            except RuntimeError as e:
-                if "disconnect message has been received" in str(e).lower():
-                    log.info(f"Audio client disconnected: session={session_id}")
-                    break
-                raise
+            data = await ws.receive()
 
             if "bytes" in data and data["bytes"] is not None:
                 chunk = data["bytes"]
                 max_chunk_bytes = audio_config.max_chunk_bytes()
-
                 if len(chunk) > max_chunk_bytes:
-                    await ws.send_json(
-                        {
-                            "type": "error",
-                            "error": f"Audio chunk too large ({len(chunk)} bytes). Max allowed is {max_chunk_bytes} for the negotiated audio format.",
-                        }
-                    )
+                    await ws.send_json({"type": "error", "error": f"Audio chunk too large ({len(chunk)} bytes)."})
                     continue
-
                 if len(chunk) % audio_config.frame_size != 0:
-                    await ws.send_json(
-                        {
-                            "type": "error",
-                            "error": "Invalid PCM frame received. Expected complete 16-bit PCM frames for the negotiated channel count.",
-                        }
-                    )
+                    await ws.send_json({"type": "error", "error": "Invalid PCM frame received."})
                     continue
-
                 audio_buffer.extend(chunk)
                 last_audio_time = time.time()
-                log.debug(f"Buffer: {len(audio_buffer)} bytes")
-
             elif "text" in data and data["text"] is not None:
                 raw_text = data["text"].strip()
-                command = raw_text.lower()
-
                 try:
                     payload = json.loads(raw_text)
                 except json.JSONDecodeError:
@@ -612,15 +690,11 @@ async def audio_ws(ws: WebSocket, session_id: str):
 
                 if isinstance(payload, dict):
                     message_type = str(payload.get("type", "")).lower()
-
                     if message_type in {"start", "config"}:
-                        try:
-                            audio_config = AudioFormatConfig.from_message(payload)
-                        except ValueError as e:
-                            await ws.send_json({"type": "error", "error": str(e)})
-                            continue
+                        audio_config = AudioFormatConfig.from_message(payload)
                         commit_driven_mode = True
-
+                        consultation_mode = normalize_consultation_mode(payload.get("consultation_mode"))
+                        speaker_role_hint = payload.get("speaker_role")
                         await ws.send_json(
                             {
                                 "type": "audio_config",
@@ -629,10 +703,10 @@ async def audio_ws(ws: WebSocket, session_id: str):
                                 "sample_width": audio_config.sample_width,
                                 "encoding": audio_config.encoding,
                                 "max_chunk_bytes": audio_config.max_chunk_bytes(),
+                                "consultation_mode": consultation_mode,
                             }
                         )
                         continue
-
                     if message_type == "commit":
                         await flush_audio_buffer()
                         continue
@@ -644,6 +718,7 @@ async def audio_ws(ws: WebSocket, session_id: str):
                         await ws.send_json({"type": "pong"})
                         continue
 
+                command = raw_text.lower()
                 if command == "commit":
                     await flush_audio_buffer()
                     continue
@@ -654,13 +729,7 @@ async def audio_ws(ws: WebSocket, session_id: str):
                 if command == "ping":
                     await ws.send_json({"type": "pong"})
                     continue
-
-                await ws.send_json(
-                    {
-                        "type": "error",
-                        "error": "Unsupported audio control message. Use 'commit', 'reset', or 'ping'.",
-                    }
-                )
+                await ws.send_json({"type": "error", "error": "Unsupported audio control message."})
                 continue
 
             current_time = time.time()
@@ -668,25 +737,21 @@ async def audio_ws(ws: WebSocket, session_id: str):
             should_flush = current_time - last_audio_time > silence_timeout
             if not commit_driven_mode:
                 should_flush = should_flush or len(audio_buffer) >= max_buffer_size
-
             if audio_buffer and should_flush:
                 await flush_audio_buffer()
-
     except WebSocketDisconnect:
-        log.info(f"Audio WebSocket disconnected: session={session_id}")
-    except Exception as e:
-        log.error(f"Audio WebSocket error [{session_id}]: {e}")
-        store.record_error(session_id, "ws.audio", str(e))
+        log.info(f"Audio consultation WebSocket disconnected: session={session_id}")
+    except Exception as exc:
+        log.error(f"Audio consultation WebSocket error [{session_id}]: {exc}")
         try:
             if ws.client_state == WebSocketState.CONNECTED:
-                await ws.close(code=1011, reason=str(e))
+                await ws.close(code=1011, reason=str(exc))
         except Exception:
             pass
 
 
 @router.websocket("/ws/tts/{session_id}")
 async def tts_ws(ws: WebSocket, session_id: str):
-    """WebSocket endpoint for TTS synthesis."""
     await ws.accept()
     log.info(f"TTS WebSocket connected: session={session_id}")
 
@@ -694,32 +759,18 @@ async def tts_ws(ws: WebSocket, session_id: str):
         while True:
             raw = await ws.receive_text()
             started_at = time.perf_counter()
-
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
-                store.record_error(session_id, "ws.tts", "Invalid JSON")
-                store.record_latency(session_id, "ws.tts", _elapsed_ms(started_at), status="error")
                 await ws.send_json({"type": "error", "error": "Invalid JSON"})
                 continue
 
             if msg.get("type") != "synthesize":
-                message = "Expected {type: 'synthesize', text: '...'}"
-                store.record_error(session_id, "ws.tts", message)
-                store.record_latency(session_id, "ws.tts", _elapsed_ms(started_at), status="error")
-                await ws.send_json(
-                    {
-                        "type": "error",
-                        "error": message,
-                    }
-                )
+                await ws.send_json({"type": "error", "error": "Expected {type: 'synthesize', text: '...'}"})
                 continue
 
             cleaned_text = clean_transcript(msg.get("text", ""))
             if not cleaned_text:
-                message = "TTS input cannot be empty."
-                store.record_error(session_id, "ws.tts", message)
-                store.record_latency(session_id, "ws.tts", _elapsed_ms(started_at), status="error")
                 await ws.send_json({"type": "error", "error": "TTS input cannot be empty."})
                 continue
 
@@ -729,7 +780,6 @@ async def tts_ws(ws: WebSocket, session_id: str):
                 fallback_languages=msg.get("languages"),
                 fallback_language=msg.get("language"),
             )
-
             await ws.send_json(
                 {
                     "type": "tts_info",
@@ -745,10 +795,10 @@ async def tts_ws(ws: WebSocket, session_id: str):
                     languages=msg.get("languages"),
                     preferred_language=msg.get("language"),
                 )
-            except Exception as e:
-                store.record_error(session_id, "ws.tts", str(e))
+            except Exception as exc:
+                store.record_error(session_id, "ws.tts", str(exc))
                 store.record_latency(session_id, "ws.tts", _elapsed_ms(started_at), status="error")
-                await ws.send_json({"type": "error", "error": str(e)})
+                await ws.send_json({"type": "error", "error": str(exc)})
                 continue
 
             for segment_result in result.segments:
@@ -779,11 +829,6 @@ async def tts_ws(ws: WebSocket, session_id: str):
                     "audio_b64": result.audio_b64,
                 }
             )
-            message_languages = msg.get("languages") or []
-            if message_languages:
-                store.track_languages(session_id, set(message_languages))
-            if result.language:
-                store.set_selected_language(session_id, result.language)
             store.record_latency(
                 session_id,
                 "ws.tts",
@@ -795,15 +840,13 @@ async def tts_ws(ws: WebSocket, session_id: str):
                     "segment_count": len(result.segments),
                 },
             )
-
     except WebSocketDisconnect:
         log.info(f"TTS WebSocket disconnected: session={session_id}")
-    except Exception as e:
-        log.error(f"TTS WebSocket error [{session_id}]: {e}")
-        store.record_error(session_id, "ws.tts", str(e))
+    except Exception as exc:
+        log.error(f"TTS WebSocket error [{session_id}]: {exc}")
         try:
             if ws.client_state == WebSocketState.CONNECTED:
-                await ws.send_json({"type": "error", "error": str(e)})
-                await ws.close(code=1011, reason=str(e))
+                await ws.send_json({"type": "error", "error": str(exc)})
+                await ws.close(code=1011, reason=str(exc))
         except Exception:
             pass

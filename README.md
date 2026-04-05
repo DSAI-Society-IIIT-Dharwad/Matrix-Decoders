@@ -1,31 +1,31 @@
 # NudiScribe
 
-NudiScribe is a multilingual conversational backend for speech-first interactions across English, Hindi, and Kannada. It is designed to handle both typed input and spoken input, including code-mixed usage where users switch between languages within the same utterance.
+NudiScribe is a multilingual healthcare consultation platform for speech-first interactions across English, Hindi, Kannada, and code-mixed speech. It handles typed turns, live voice turns, structured healthcare extraction, report parsing, session history, and multilingual assistant responses.
 
-The current repository contains the backend service layer that performs:
+The current repository contains a healthcare-focused backend and frontend that perform:
 
 - audio transcription
 - language and script detection
-- code-mixed input handling
+- doctor and patient role inference
+- real-time structured healthcare extraction
+- report upload parsing
 - session-aware conversational orchestration
-- streaming LLM responses through Ollama
+- streaming LLM responses and TTS through Ollama plus local speech runtimes
 
 ## Project Goal
 
-The long-term goal of NuDiscribe is to provide a robust multilingual speech orchestration platform for Indian language usage patterns, especially mixed-language conversations that are poorly handled by conventional monolingual assistants.
+The current goal of NuDiscribe is to provide a robust multilingual healthcare consultation workspace aligned to the hackathon problem statement:
 
-The system is intended to support:
-
-- English-only conversations
-- Hindi-English code-mixed conversations
-- Kannada-English code-mixed conversations
-- script-based and Romanized input
-- speech-to-text to LLM conversational flows
-- future text-to-speech and more production-grade deployment patterns
+- capture live and uploaded voice interactions
+- support English, Hindi, Kannada, and code-mixed speech
+- manage dynamic two-way consultation and follow-up conversations
+- extract editable structured healthcare reports in real time
+- retain longitudinal consultation history and telemetry
+- provide multilingual assistant voice responses
 
 ## Current Scope
 
-This repository currently contains a FastAPI backend prototype. It exposes REST and WebSocket APIs for text chat, transcription, and speech-driven conversational workflows.
+This repository contains a FastAPI backend plus a React frontend for healthcare-only consultation workflows. It exposes REST and WebSocket APIs for text chat, live audio capture, transcription, structured report extraction, TTS, and longitudinal session review.
 
 Core modules in the current implementation:
 
@@ -36,26 +36,45 @@ Core modules in the current implementation:
 - `backend/app/language.py`: script and language heuristics
 - `backend/app/ollama_client.py`: Ollama streaming client
 - `backend/app/memory.py`: SQLite-backed session and telemetry persistence
-- `backend/app/prompt.py`: language-aware prompting strategy
+- `backend/app/prompt.py`: healthcare-aware prompting strategy
 - `backend/app/tts_router.py`: AI4Bharat-first TTS routing with fallback providers
+- `backend/app/consultation.py`: doctor/patient role inference and structured healthcare extraction
+- `backend/app/document_parser.py`: PDF/TXT/JSON/CSV report extraction
+- `frontend/src/App.tsx`: healthcare consultation frontend
 
 ## Implemented Features
 
 - FastAPI backend service with CORS enabled
+- React frontend for live healthcare consultation and follow-up workflows
 - `GET /api/health` for service health and model availability
-- `POST /api/chat` for text-based multilingual chat
+- `POST /api/consultation/start` for assistant-led consultation or follow-up openings
+- `POST /api/chat` for text-based multilingual consultation turns
 - `POST /api/transcribe` for uploaded audio transcription
+- `POST /api/report/extract` for healthcare report parsing from PDF/TXT/MD/JSON/CSV
+- `POST /api/tts` for multilingual assistant voice synthesis
 - `DELETE /api/session/{session_id}` to clear session memory
 - `GET /api/sessions` to inspect active persisted sessions
+- `GET /api/session/{session_id}` for consultation timelines, transcripts, telemetry, and structured report state
 - `WebSocket /ws/{session_id}` for streaming text chat
 - `WebSocket /ws/audio/{session_id}` for streaming audio input
+- `WebSocket /ws/tts/{session_id}` for streamed TTS segment playback
 - Whisper-based transcription path for English and general fallback
 - Indic ASR integration for Hindi and Kannada
 - heuristic merging of Whisper and Indic ASR outputs
-- detection of Devanagari, Kannada, English, and some Romanized Hindi/Kannada patterns
-- language-aware prompting so the assistant mirrors the user’s language style
+- language clamping to English, Hindi, Kannada, and supported code-mixed combinations only
+- doctor and patient speaker inference for typed and spoken turns
+- healthcare-only structured extraction:
+  - complaint/query
+  - background history
+  - observations/responses
+  - diagnosis/classification/status
+  - action plan/treatment plan
+  - verification and survey responses
+  - symptoms, past history, clinical observations, diagnosis, treatment advice
+  - immunization, pregnancy, risk, injury/mobility, and ENT fields
+- editable structured review on the frontend
 - persisted conversation history with a bounded context window
-- example client scripts for manual text and audio testing
+- local backend tests for healthcare extraction and ASR language routing
 
 ## Current Status
 
@@ -74,11 +93,9 @@ What is not yet complete:
 
 - the persistence layer currently targets a local SQLite database for development, not a production PostgreSQL deployment
 - no authentication or access control exists
-- no automated test suite is present
-- no containerization or deployment configuration is included
 - no production observability stack exists
-- text-to-speech is implemented end to end at the backend layer, with runtime validation and provider diagnostics included; deployment still requires local model/runtime setup
-- multilingual quality is heuristic-driven and still needs evaluation against real usage data
+- TTS quality still depends on which local provider assets are configured
+- multilingual quality and speaker-role heuristics still need evaluation against real usage audio
 
 In practical terms, this repository should be viewed as a functional backend prototype, not a production-ready application.
 
@@ -177,6 +194,8 @@ OLLAMA_TIMEOUT=120
 
 Copy `.env.example` to repo-root `.env` or `backend/.env` and fill in the TTS paths if you want Hindi/Kannada synthesis through AI4Bharat Indic-TTS.
 
+For a repo-specific end-to-end setup guide that covers AI4Bharat, Piper, Coqui, and the current runtime warnings, see [TTS_RUNTIME_SETUP.md](/media/raviteja/Volume/nudiscribe/TTS_RUNTIME_SETUP.md).
+
 ### Install Dependencies
 
 ```bash
@@ -202,6 +221,26 @@ The default local server endpoint is typically:
 
 ```text
 http://127.0.0.1:8000
+```
+
+## Docker Compose
+
+The repository now includes containerization for the frontend, backend, and Ollama runtime:
+
+```bash
+docker compose up --build
+```
+
+Services:
+
+- frontend: `http://127.0.0.1:8080`
+- backend: `http://127.0.0.1:8000`
+- ollama: `http://127.0.0.1:11434`
+
+To pre-pull the configured Ollama model into the shared volume:
+
+```bash
+docker compose --profile setup up ollama-init
 ```
 
 ### Validate The Current Product

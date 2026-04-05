@@ -1,28 +1,77 @@
-from typing import List, Optional
+from __future__ import annotations
+
+from typing import Any, List, Optional
 
 from pydantic import BaseModel, Field
 
 
-class ChatRequest(BaseModel):
-    """Request body for the text chat endpoint."""
+class KnowledgeHit(BaseModel):
+    topic: str
+    summary: str
+    source_name: str
+    source_url: str
+    keywords: List[str] = Field(default_factory=list)
+    recommendation: str = Field(default="", description="Actionable recommendation from the resource")
 
+
+class StructuredReport(BaseModel):
+    complaint_query: str = ""
+    background_history: str = ""
+    observations_responses: str = ""
+    diagnosis_classification_status: str = ""
+    action_plan_treatment_plan: str = ""
+    verification_survey_responses: str = ""
+    symptoms: str = ""
+    past_history: str = ""
+    clinical_observations: str = ""
+    diagnosis: str = ""
+    treatment_advice: str = ""
+    immunization_data: str = ""
+    pregnancy_data: str = ""
+    risk_indicators: str = ""
+    injury_mobility: str = ""
+    ent_findings: str = ""
+    risk_level: str = "routine"
+    red_flags: List[str] = Field(default_factory=list)
+    pending_questions: List[str] = Field(default_factory=list)
+    care_summary: str = ""
+
+
+class ConsultationTurn(BaseModel):
+    id: int | None = None
+    speaker_role: str
+    text: str
+    language: str = "en"
+    languages: List[str] = Field(default_factory=list)
+    created_at: str = ""
+
+
+class ChatRequest(BaseModel):
     session_id: str = Field(default="default", description="Session identifier")
-    text: str = Field(..., description="User message text")
+    text: str = Field(..., description="Speaker utterance")
+    speaker_role: str | None = Field(default=None, description="Optional speaker role hint")
+    consultation_mode: str = Field(default="consultation", description="consultation or follow_up")
 
 
 class ChatResponse(BaseModel):
-    """Response from the text chat endpoint."""
-
     text: str
     language: str
     languages: List[str] = Field(default_factory=list)
     is_code_mixed: bool = False
     session_id: str
+    speaker_role: str = "patient"
+    consultation_mode: str = "consultation"
+    structured_report: StructuredReport = Field(default_factory=StructuredReport)
+    knowledge_hits: List[KnowledgeHit] = Field(default_factory=list)
+    suggested_questions: List[str] = Field(default_factory=list)
+
+
+class StartConsultationRequest(BaseModel):
+    session_id: str = Field(default="default")
+    consultation_mode: str = Field(default="consultation")
 
 
 class TranscriptSegment(BaseModel):
-    """A single transcript segment from ASR."""
-
     index: Optional[int] = None
     text: str
     start_ms: Optional[int] = None
@@ -36,18 +85,47 @@ class TranscriptSegment(BaseModel):
 
 
 class TranscribeResponse(BaseModel):
-    """Response from the transcription endpoint."""
-
     text: str
     language: str
     languages: List[str] = Field(default_factory=list)
     is_code_mixed: bool = False
     segments: List[TranscriptSegment] = Field(default_factory=list)
+    speaker_role: str = "patient"
+    structured_report: StructuredReport = Field(default_factory=StructuredReport)
+    knowledge_hits: List[KnowledgeHit] = Field(default_factory=list)
+    suggested_questions: List[str] = Field(default_factory=list)
+
+
+class ReportExtractResponse(BaseModel):
+    filename: str
+    text: str
+    structured_report: StructuredReport = Field(default_factory=StructuredReport)
+    knowledge_hits: List[KnowledgeHit] = Field(default_factory=list)
+    dynamic_json: dict[str, Any] = Field(default_factory=dict)
+    dynamic_issues: List[str] = Field(default_factory=list)
+    dynamic_used_llm: bool = False
+    dynamic_fallback_used: bool = False
+
+
+class DynamicExtractRequest(BaseModel):
+    text: str = Field(..., description="Source text to extract from")
+    schema: dict[str, Any] = Field(
+        ...,
+        description="JSON schema object that defines extraction fields and types",
+    )
+    context: str = Field(default="", description="Optional extraction context or instructions")
+    session_id: Optional[str] = Field(default=None, description="Optional session identifier for telemetry")
+
+
+class DynamicExtractResponse(BaseModel):
+    result: dict[str, Any] = Field(default_factory=dict)
+    normalized_schema: dict[str, Any] = Field(default_factory=dict)
+    issues: List[str] = Field(default_factory=list)
+    used_llm: bool = False
+    fallback_used: bool = False
 
 
 class HealthResponse(BaseModel):
-    """Health check response."""
-
     status: str = "ok"
     model: str
     uptime_seconds: float
@@ -62,16 +140,12 @@ class HealthResponse(BaseModel):
 
 
 class TTSRequest(BaseModel):
-    """Request body for TTS synthesis."""
-
     text: str = Field(..., description="Text to synthesize")
     language: Optional[str] = Field(default=None, description="Preferred response language")
     languages: List[str] = Field(default_factory=list)
 
 
 class TTSResponse(BaseModel):
-    """Response body for synthesized audio."""
-
     text: str
     language: str
     provider: str
@@ -81,8 +155,6 @@ class TTSResponse(BaseModel):
 
 
 class SessionSummary(BaseModel):
-    """Summary view for a persisted session."""
-
     session_id: str
     created_at: str
     updated_at: str
@@ -96,8 +168,6 @@ class SessionSummary(BaseModel):
 
 
 class SessionMessageRecord(BaseModel):
-    """Persisted session message record."""
-
     id: int
     role: str
     content: str
@@ -105,8 +175,6 @@ class SessionMessageRecord(BaseModel):
 
 
 class SessionTranscriptRecord(BaseModel):
-    """Persisted transcript record."""
-
     id: int
     source: str
     text: str
@@ -114,26 +182,22 @@ class SessionTranscriptRecord(BaseModel):
     languages: List[str] = Field(default_factory=list)
     is_code_mixed: bool = False
     segments: List[TranscriptSegment] = Field(default_factory=list)
-    details: dict = Field(default_factory=dict)
+    details: dict[str, Any] = Field(default_factory=dict)
     created_at: str
 
 
 class SessionTelemetryRecord(BaseModel):
-    """Persisted telemetry record."""
-
     id: int
     kind: str
     name: str
     status: str = ""
     latency_ms: Optional[float] = None
     error_message: str = ""
-    details: dict = Field(default_factory=dict)
+    details: dict[str, Any] = Field(default_factory=dict)
     created_at: str
 
 
 class SessionDetailResponse(BaseModel):
-    """Detailed persisted session snapshot."""
-
     session_id: str
     created_at: str
     updated_at: str
@@ -145,19 +209,19 @@ class SessionDetailResponse(BaseModel):
     messages: List[SessionMessageRecord] = Field(default_factory=list)
     transcripts: List[SessionTranscriptRecord] = Field(default_factory=list)
     telemetry: List[SessionTelemetryRecord] = Field(default_factory=list)
+    consultation_turns: List[ConsultationTurn] = Field(default_factory=list)
+    structured_report: StructuredReport = Field(default_factory=StructuredReport)
+    knowledge_hits: List[KnowledgeHit] = Field(default_factory=list)
+    suggested_questions: List[str] = Field(default_factory=list)
 
 
 class SessionListResponse(BaseModel):
-    """List of active persisted sessions."""
-
     sessions: List[str] = Field(default_factory=list)
     count: int = 0
     items: List[SessionSummary] = Field(default_factory=list)
 
 
 class OrchestratorEvent(BaseModel):
-    """Streaming event from the orchestrator."""
-
     type: str
     text: Optional[str] = None
     language: Optional[str] = None
@@ -165,10 +229,15 @@ class OrchestratorEvent(BaseModel):
     is_code_mixed: Optional[bool] = None
     segments: Optional[List[TranscriptSegment]] = None
     tts_plan: Optional[List[str]] = None
-    tts_segments: Optional[List[dict]] = None
+    tts_segments: Optional[List[dict[str, Any]]] = None
     tts_language: Optional[str] = None
     provider: Optional[str] = None
     mime_type: Optional[str] = None
     sample_rate: Optional[int] = None
     audio_b64: Optional[str] = None
     error: Optional[str] = None
+    speaker_role: Optional[str] = None
+    consultation_mode: Optional[str] = None
+    structured_report: Optional[StructuredReport] = None
+    knowledge_hits: Optional[List[KnowledgeHit]] = None
+    suggested_questions: Optional[List[str]] = None

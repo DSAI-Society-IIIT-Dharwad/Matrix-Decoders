@@ -11,10 +11,11 @@ from .tts_router import tts_router
 log = get_logger("main")
 
 app = FastAPI(
-    title="NuDiscribe - Multilingual Speech Orchestrator",
+    title="NuDiscribe - Multilingual Healthcare Consultation Platform",
     description=(
-        "Code-mixed speech recognition and conversational AI "
-        "for Hindi, English, and Kannada."
+        "Healthcare-focused multilingual speech recognition, live consultation support, "
+        "structured report extraction, and voice response for Hindi, English, Kannada, "
+        "and code-mixed speech."
     ),
     version="2.1.0",
 )
@@ -64,12 +65,18 @@ async def root():
         "status": "ok",
         "model": settings.ollama_model,
         "features": [
-            "code-mixed-speech",
-            "hindi-english",
-            "kannada-english",
-            "streaming-llm",
-            "websocket-audio",
-            "tts-routing",
+            "assistant-led-healthcare-consultation",
+            "zero-shot-dynamic-json-extraction",
+            "multilingual-and-code-mixed-asr",
+            "whisper-and-indic-asr-routing",
+            "dynamic-follow-up-questioning",
+            "structured-healthcare-report-extraction",
+            "editable-review-workflow",
+            "report-upload-parsing",
+            "longitudinal-session-history",
+            "websocket-audio-consultation",
+            "ai4bharat-first-tts-routing",
+            "multi-provider-tts-fallbacks",
             "websocket-tts",
             "runtime-validation",
         ],

@@ -1,5 +1,14 @@
-export type DomainMode = "healthcare" | "financial";
-export type TransportMode = "rest" | "websocket";
+export type ConsultationMode = "consultation" | "follow_up";
+export type SpeakerRole = "auto" | "patient" | "doctor" | "assistant" | "document";
+export type AppView = "landing" | "consultation_text" | "consultation_voice" | "transcription";
+
+export interface TranscriptLine {
+  id: string;
+  speaker: string;
+  text: string;
+  timestamp: string;
+  language: string;
+}
 
 export interface RootInfo {
   service: string;
@@ -23,6 +32,47 @@ export interface HealthResponse {
   warnings: string[];
 }
 
+export interface KnowledgeHit {
+  topic: string;
+  summary: string;
+  source_name: string;
+  source_url: string;
+  keywords: string[];
+  recommendation: string;
+}
+
+export interface StructuredReport {
+  complaint_query: string;
+  background_history: string;
+  observations_responses: string;
+  diagnosis_classification_status: string;
+  action_plan_treatment_plan: string;
+  verification_survey_responses: string;
+  symptoms: string;
+  past_history: string;
+  clinical_observations: string;
+  diagnosis: string;
+  treatment_advice: string;
+  immunization_data: string;
+  pregnancy_data: string;
+  risk_indicators: string;
+  injury_mobility: string;
+  ent_findings: string;
+  risk_level: string;
+  red_flags: string[];
+  pending_questions: string[];
+  care_summary: string;
+}
+
+export interface ConsultationTurn {
+  id?: number | null;
+  speaker_role: string;
+  text: string;
+  language: string;
+  languages: string[];
+  created_at: string;
+}
+
 export interface TranscriptSegment {
   index?: number | null;
   text: string;
@@ -42,6 +92,11 @@ export interface ChatResponse {
   languages: string[];
   is_code_mixed: boolean;
   session_id: string;
+  speaker_role: string;
+  consultation_mode: ConsultationMode;
+  structured_report: StructuredReport;
+  knowledge_hits: KnowledgeHit[];
+  suggested_questions: string[];
 }
 
 export interface TranscribeResponse {
@@ -50,6 +105,29 @@ export interface TranscribeResponse {
   languages: string[];
   is_code_mixed: boolean;
   segments: TranscriptSegment[];
+  speaker_role: string;
+  structured_report: StructuredReport;
+  knowledge_hits: KnowledgeHit[];
+  suggested_questions: string[];
+}
+
+export interface ReportExtractResponse {
+  filename: string;
+  text: string;
+  structured_report: StructuredReport;
+  knowledge_hits: KnowledgeHit[];
+  dynamic_json: Record<string, unknown>;
+  dynamic_issues: string[];
+  dynamic_used_llm: boolean;
+  dynamic_fallback_used: boolean;
+}
+
+export interface DynamicExtractResponse {
+  result: Record<string, unknown>;
+  normalized_schema: Record<string, unknown>;
+  issues: string[];
+  used_llm: boolean;
+  fallback_used: boolean;
 }
 
 export interface TTSResponse {
@@ -122,6 +200,10 @@ export interface SessionDetailResponse {
   messages: SessionMessageRecord[];
   transcripts: SessionTranscriptRecord[];
   telemetry: SessionTelemetryRecord[];
+  consultation_turns: ConsultationTurn[];
+  structured_report: StructuredReport;
+  knowledge_hits: KnowledgeHit[];
+  suggested_questions: string[];
 }
 
 export interface LanguageInfoEvent {
@@ -129,6 +211,8 @@ export interface LanguageInfoEvent {
   languages: string[];
   dominant_language?: string;
   is_code_mixed?: boolean;
+  speaker_role?: string;
+  consultation_mode?: ConsultationMode;
 }
 
 export interface DeltaEvent {
@@ -155,6 +239,11 @@ export interface FinalEvent {
   sample_rate?: number;
   audio_b64?: string;
   segment_count?: number;
+  speaker_role?: string;
+  consultation_mode?: ConsultationMode;
+  structured_report?: StructuredReport;
+  knowledge_hits?: KnowledgeHit[];
+  suggested_questions?: string[];
 }
 
 export interface ErrorEvent {
@@ -169,6 +258,7 @@ export interface AudioConfigEvent {
   sample_width: number;
   encoding: string;
   max_chunk_bytes: number;
+  consultation_mode?: ConsultationMode;
 }
 
 export interface AudioSkippedEvent {
@@ -178,6 +268,7 @@ export interface AudioSkippedEvent {
 
 export interface TranscriptionEvent extends TranscribeResponse {
   type: "transcription";
+  consultation_mode?: ConsultationMode;
 }
 
 export interface PongEvent {
@@ -222,17 +313,13 @@ export type AudioStreamEvent =
 
 export type TTSStreamEvent = TTSInfoEvent | AudioChunkEvent | FinalEvent | ErrorEvent;
 
-export interface ReviewFieldDefinition {
-  key: string;
-  label: string;
-  placeholder: string;
-}
-
 export interface AudioSocketConfig {
   sample_rate: number;
   channels: number;
   sample_width: number;
   encoding: string;
+  consultation_mode?: ConsultationMode;
+  speaker_role?: string;
 }
 
 export interface ActivityItem {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 import threading
@@ -10,6 +11,7 @@ import whisper
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
 from ..config import settings
+from ..language import normalize_supported_language, SUPPORTED_LANGUAGE_CODES
 from ..logger import get_logger
 
 log = get_logger("asr.whisper")
@@ -54,6 +56,20 @@ class _HFWhisperRuntime:
             token_id: token.replace("<|", "").replace("|>", "")
             for token, token_id in (self.model.generation_config.lang_to_id or {}).items()
         }
+        self._supported_lang_to_id = {
+            token: token_id
+            for token, token_id in (self.model.generation_config.lang_to_id or {}).items()
+            if token.replace("<|", "").replace("|>", "") in SUPPORTED_LANGUAGE_CODES
+        }
+        self._language_detection_config = None
+        if self._supported_lang_to_id:
+            self._language_detection_config = deepcopy(self.model.generation_config)
+            self._language_detection_config.lang_to_id = self._supported_lang_to_id.copy()
+        else:
+            log.warning(
+                "Fine-tuned Whisper checkpoint did not expose supported language tokens; "
+                "language detection will fall back to English."
+            )
 
     def transcribe(self, audio_path: str) -> _TranscriptionResult:
         batch = self._prepare_batch(audio_path)
@@ -63,9 +79,15 @@ class _HFWhisperRuntime:
         language = "en"
         with torch.inference_mode():
             try:
-                language_ids = self.model.detect_language(input_features=input_features)
-                if language_ids.numel() > 0:
-                    language = self._lang_id_to_code.get(int(language_ids[0]), "en")
+                if self._language_detection_config is not None:
+                    language_ids = self.model.detect_language(
+                        input_features=input_features,
+                        generation_config=self._language_detection_config,
+                    )
+                    if language_ids.numel() > 0:
+                        language = normalize_supported_language(
+                            self._lang_id_to_code.get(int(language_ids[0]), "en")
+                        )
             except Exception as exc:
                 log.warning(f"Fine-tuned Whisper language detection failed: {exc}")
 
@@ -113,10 +135,10 @@ class _OpenAIWhisperRuntime:
         self.model = whisper.load_model(model_name).to(device)
 
     def transcribe(self, audio_path: str) -> _TranscriptionResult:
-        result = self.model.transcribe(audio_path)
+        result = self.model.transcribe(audio_path, language="en", task="transcribe")
         return _TranscriptionResult(
             text=result.get("text", "").strip(),
-            language=result.get("language", "en") or "en",
+            language=normalize_supported_language(result.get("language", "en") or "en"),
         )
 
 

@@ -1,9 +1,11 @@
 import re
-from typing import Set, Optional
+from typing import Iterable, Optional, Set
 
 from .logger import get_logger
 
 log = get_logger("language")
+
+SUPPORTED_LANGUAGE_CODES = frozenset({"en", "hi", "kn"})
 
 # Unicode ranges for script detection
 _DEVANAGARI = re.compile(r"[\u0900-\u097F]")   # Hindi
@@ -34,6 +36,11 @@ _KANNADA_ROMAN = re.compile(
     r"gottu|gottilla|beku|beda|aaguttade|aaytu|"
     r"swalpa|thumba|yella|ondhu|eradu|mooru)\b",
     re.IGNORECASE,
+)
+
+_TOKEN_PATTERN = re.compile(
+    r"\s+|[A-Za-z]+(?:['-][A-Za-z]+)*|[\u0900-\u097F]+|[\u0C80-\u0CFF]+|\d+|[^\w\s]+",
+    re.UNICODE,
 )
 
 
@@ -74,6 +81,95 @@ def detect_language(text: str) -> str:
     return get_dominant_language(text, scripts)
 
 
+def normalize_supported_language(language: str, fallback: str = "en") -> str:
+    """Clamp a language code to the supported ASR/TTS set."""
+    if language in SUPPORTED_LANGUAGE_CODES:
+        return language
+    if fallback in SUPPORTED_LANGUAGE_CODES:
+        return fallback
+    return "en"
+
+
+def filter_supported_languages(languages: Optional[Iterable[str]]) -> Set[str]:
+    """Keep only supported language codes from an arbitrary iterable."""
+    return {lang for lang in (languages or []) if lang in SUPPORTED_LANGUAGE_CODES}
+
+
+def classify_token_language(token: str) -> str | None:
+    """Classify a single token for code-mixed routing."""
+    if not token or token.isspace():
+        return None
+
+    if _DEVANAGARI.search(token):
+        return "hi"
+    if _KANNADA.search(token):
+        return "kn"
+    if _HINDI_ROMAN.fullmatch(token):
+        return "hi"
+    if _KANNADA_ROMAN.fullmatch(token):
+        return "kn"
+    if _LATIN.search(token):
+        return "en"
+
+    return None
+
+
+def segment_text_by_language(
+    text: str,
+    languages: Optional[Iterable[str]] = None,
+    preferred_language: Optional[str] = None,
+) -> list[tuple[str, str]]:
+    """Split code-mixed text into contiguous language-specific chunks."""
+    allowed_languages = filter_supported_languages(languages)
+    normalized_preferred = (
+        preferred_language if preferred_language in SUPPORTED_LANGUAGE_CODES else None
+    )
+    groups: list[list[object]] = []
+    pending_prefix = ""
+
+    for token in _TOKEN_PATTERN.findall(text):
+        token_language = classify_token_language(token)
+        if token_language is None:
+            if groups:
+                parts = groups[-1][1]
+                assert isinstance(parts, list)
+                parts.append(token)
+            else:
+                pending_prefix += token
+            continue
+
+        if groups and groups[-1][0] == token_language:
+            parts = groups[-1][1]
+            assert isinstance(parts, list)
+            parts.append(token)
+            continue
+
+        groups.append([token_language, [pending_prefix, token]])
+        pending_prefix = ""
+
+    if pending_prefix and groups:
+        parts = groups[-1][1]
+        assert isinstance(parts, list)
+        parts.append(pending_prefix)
+
+    if not groups:
+        cleaned = text.strip()
+        if not cleaned:
+            return []
+        fallback_languages = allowed_languages or detect_scripts(cleaned)
+        fallback = normalize_supported_language(
+            normalized_preferred or get_dominant_language(cleaned, fallback_languages)
+        )
+        return [(cleaned, fallback)]
+
+    segmented: list[tuple[str, str]] = []
+    for language, parts in groups:
+        chunk_text = "".join(parts).strip()
+        if chunk_text:
+            segmented.append((chunk_text, str(language)))
+    return segmented
+
+
 def is_code_mixed(text: str) -> bool:
     """Check if text contains multiple languages."""
     scripts = detect_scripts(text)
@@ -86,7 +182,7 @@ def get_dominant_language(text: str, scripts: Optional[Set[str]] = None) -> str:
     if scripts is None:
         scripts = detect_scripts(text)
 
-    scripts.discard("unknown")
+    scripts = filter_supported_languages(scripts)
 
     if not scripts:
         return "unknown"
@@ -120,7 +216,10 @@ def get_dominant_language(text: str, scripts: Optional[Set[str]] = None) -> str:
 def describe_languages(scripts: Set[str]) -> str:
     """Return human-readable description of language mix."""
     names = {"hi": "Hindi", "kn": "Kannada", "en": "English", "unknown": "Unknown"}
-    lang_names = [names.get(s, s) for s in sorted(scripts) if s != "unknown"]
+    lang_names = [
+        names.get(s, s)
+        for s in sorted(filter_supported_languages(scripts))
+    ]
 
     if not lang_names:
         return "Unknown"

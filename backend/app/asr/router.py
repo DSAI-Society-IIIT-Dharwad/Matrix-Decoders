@@ -24,14 +24,6 @@ class CodeMixedResult:
     segments: list = field(default_factory=list)
 
 
-def _is_mostly_ascii(text: str) -> bool:
-    """Check if text is mostly ASCII characters."""
-    if not text:
-        return True
-    ascii_count = sum(1 for c in text if ord(c) < 128)
-    return ascii_count / len(text) > 0.9
-
-
 def _score_text(text: str) -> int:
     """Score transcription quality based on length and cleanliness."""
     text = clean_transcript(text)
@@ -62,25 +54,31 @@ def _merge_transcriptions(whisper_text: str, hi_text: str, kn_text: str) -> tupl
     kn_text = clean_transcript(kn_text)
 
     whisper_langs = detect_scripts(whisper_text) if whisper_text else set()
+    hi_langs = detect_scripts(hi_text) if hi_text else set()
+    kn_langs = detect_scripts(kn_text) if kn_text else set()
 
     if whisper_text and is_code_mixed(whisper_text):
         log.info("Code-mixed speech detected in Whisper output")
         return whisper_text, whisper_langs
 
+    script_candidates = []
+    if hi_text and (hi_langs - {"en"}):
+        script_candidates.append((hi_text, hi_langs, scores["hi"]))
+    if kn_text and (kn_langs - {"en"}):
+        script_candidates.append((kn_text, kn_langs, scores["kn"]))
+
+    if script_candidates:
+        best_text, best_langs, _ = max(script_candidates, key=lambda item: item[2])
+        return best_text, best_langs
+
     if scores["whisper"] > max(scores["hi"], scores["kn"]) * 1.5:
         return whisper_text, whisper_langs
 
     if scores["hi"] >= scores["kn"] and scores["hi"] > scores["whisper"] * 0.7:
-        combined_langs = detect_scripts(hi_text)
-        if "en" in whisper_langs:
-            combined_langs.add("en")
-        return hi_text, combined_langs
+        return hi_text, hi_langs
 
     if scores["kn"] > scores["hi"] and scores["kn"] > scores["whisper"] * 0.7:
-        combined_langs = detect_scripts(kn_text)
-        if "en" in whisper_langs:
-            combined_langs.add("en")
-        return kn_text, combined_langs
+        return kn_text, kn_langs
 
     best = max(
         [
@@ -101,14 +99,6 @@ class ASRRouter:
 
         whisper_text = await loop.run_in_executor(None, transcribe_english, audio_path)
         whisper_text = clean_transcript(whisper_text)
-
-        clean_text = whisper_text.strip()
-        if (
-            _is_mostly_ascii(clean_text)
-            and len(clean_text.split()) > 3
-            and not is_code_mixed(clean_text)
-        ):
-            return clean_text, {"en"}, "whisper"
 
         hi_text = await loop.run_in_executor(None, transcribe_indic, audio_path, "hi")
         kn_text = await loop.run_in_executor(None, transcribe_indic, audio_path, "kn")

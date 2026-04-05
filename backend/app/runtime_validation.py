@@ -204,7 +204,21 @@ def collect_runtime_validation_report(run_command_probes: bool = False) -> Runti
                     )
                 )
 
-    if run_command_probes and settings.enable_tts:
+    indic_tts_requested = any(
+        (
+            settings.indic_tts_model_hi,
+            settings.indic_tts_config_hi,
+            settings.indic_tts_vocoder_hi,
+            settings.indic_tts_vocoder_config_hi,
+            settings.indic_tts_model_kn,
+            settings.indic_tts_config_kn,
+            settings.indic_tts_vocoder_kn,
+            settings.indic_tts_vocoder_config_kn,
+            settings.indic_tts_command_template,
+        )
+    )
+
+    if run_command_probes and settings.enable_tts and indic_tts_requested:
         ok, message = _probe_python_module(settings.indic_tts_python_bin or "python", "TTS")
         if not ok:
             report.issues.append(

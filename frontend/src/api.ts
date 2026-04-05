@@ -2,8 +2,10 @@ import type {
   AudioSocketConfig,
   AudioStreamEvent,
   ChatResponse,
+  DynamicExtractResponse,
   FinalEvent,
   HealthResponse,
+  ReportExtractResponse,
   RootInfo,
   SessionDetailResponse,
   SessionListResponse,
@@ -73,11 +75,26 @@ export async function clearSession(baseUrl: string, sessionId: string): Promise<
   });
 }
 
+export async function startConsultation(
+  baseUrl: string,
+  payload: { session_id: string; consultation_mode: string }
+): Promise<ChatResponse> {
+  return requestJson<ChatResponse>(baseUrl, "/api/consultation/start", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+}
+
 export async function chatRest(
   baseUrl: string,
   payload: {
     session_id: string;
     text: string;
+    speaker_role?: string;
+    consultation_mode: string;
   }
 ): Promise<ChatResponse> {
   return requestJson<ChatResponse>(baseUrl, "/api/chat", {
@@ -105,6 +122,40 @@ export async function transcribeFile(
   });
 }
 
+export async function extractReportFile(
+  baseUrl: string,
+  file: File,
+  sessionId?: string
+): Promise<ReportExtractResponse> {
+  const body = new FormData();
+  body.set("file", file);
+  if (sessionId) {
+    body.set("session_id", sessionId);
+  }
+  return requestJson<ReportExtractResponse>(baseUrl, "/api/report/extract", {
+    method: "POST",
+    body
+  });
+}
+
+export async function dynamicExtract(
+  baseUrl: string,
+  payload: {
+    text: string;
+    schema: Record<string, unknown>;
+    context?: string;
+    session_id?: string;
+  }
+): Promise<DynamicExtractResponse> {
+  return requestJson<DynamicExtractResponse>(baseUrl, "/api/extract/dynamic", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+}
+
 export async function ttsRest(
   baseUrl: string,
   payload: {
@@ -122,35 +173,14 @@ export async function ttsRest(
   });
 }
 
-function waitForWebSocketOpen(socket: WebSocket): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (socket.readyState === WebSocket.OPEN) {
-      resolve();
-      return;
-    }
-
-    const handleOpen = () => {
-      cleanup();
-      resolve();
-    };
-    const handleError = () => {
-      cleanup();
-      reject(new Error("WebSocket connection failed."));
-    };
-    const cleanup = () => {
-      socket.removeEventListener("open", handleOpen);
-      socket.removeEventListener("error", handleError);
-    };
-
-    socket.addEventListener("open", handleOpen);
-    socket.addEventListener("error", handleError);
-  });
-}
-
 export async function streamTextChat(
   baseUrl: string,
   sessionId: string,
-  text: string,
+  payload: {
+    text: string;
+    speaker_role?: string;
+    consultation_mode: string;
+  },
   onEvent: (event: TextStreamEvent) => void
 ): Promise<FinalEvent> {
   const socket = new WebSocket(buildWsUrl(baseUrl, `/ws/${encodeURIComponent(sessionId)}`));
@@ -168,21 +198,21 @@ export async function streamTextChat(
     };
 
     socket.addEventListener("open", () => {
-      socket.send(JSON.stringify({ type: "input", text }));
+      socket.send(JSON.stringify({ type: "input", ...payload }));
     });
 
     socket.addEventListener("message", (message) => {
       try {
-        const payload = JSON.parse(String(message.data)) as TextStreamEvent;
-        onEvent(payload);
-        if (payload.type === "final") {
+        const eventPayload = JSON.parse(String(message.data)) as TextStreamEvent;
+        onEvent(eventPayload);
+        if (eventPayload.type === "final") {
           settled = true;
           socket.close();
-          resolve(payload);
+          resolve(eventPayload);
           return;
         }
-        if (payload.type === "error") {
-          fail(new Error(payload.error || "Text stream failed."));
+        if (eventPayload.type === "error") {
+          fail(new Error(eventPayload.error || "Text stream failed."));
         }
       } catch (error) {
         fail(error instanceof Error ? error : new Error("Invalid text stream payload."));
@@ -243,7 +273,9 @@ export function createAudioSocketSession(
         sample_rate: config.sample_rate,
         channels: config.channels,
         sample_width: config.sample_width,
-        encoding: config.encoding
+        encoding: config.encoding,
+        consultation_mode: config.consultation_mode,
+        speaker_role: config.speaker_role
       })
     );
   });

@@ -17,7 +17,7 @@ Build the first frontend for NudiScribe as a thin frontend over the existing bac
     - WS /ws/tts/{session_id}
   - Product goals from the problem statement: live and remote voice capture, multilingual/code-mixed
   conversations, dynamic two-way conversation, structured extraction, editable review, longitudinal history/
-  dashboard, and domain-specific healthcare / financial-survey workflows.
+  dashboard, and healthcare-specific workflows.
 
   Critical implementation rules:
   - This must be a frontend-only build against the current FastAPI backend.
@@ -42,7 +42,6 @@ Build the first frontend for NudiScribe as a thin frontend over the existing bac
   1. Command Center
   - Show backend health from GET /api/health.
   - Show current model, uptime, active sessions, TTS readiness, warnings, and errors.
-  - Include domain switcher: Healthcare, Financial/Survey.
   - Include session picker from GET /api/sessions, create-new-session action, and clear-session action via
   DELETE /api/session/{session_id}.
 
@@ -78,17 +77,6 @@ Build the first frontend for NudiScribe as a thin frontend over the existing bac
     - risk indicators
     - injury and mobility details
     - ENT findings
-  - Financial/survey fields:
-    - identity verification
-    - account/loan confirmation
-    - payment status
-    - payer identity
-    - payment date
-    - payment mode
-    - executive interaction details
-    - reason for payment
-    - amount paid
-
   4. Longitudinal History / Dashboard
   - Show searchable session list and summary cards.
   - Use real session IDs from GET /api/sessions.
@@ -114,7 +102,7 @@ Build the first frontend for NudiScribe as a thin frontend over the existing bac
 
   Engineering expectations:
   - Deliver real code, not pseudocode.
-  - Organize with typed API clients, websocket services, reusable hooks, domain schemas, and clean component
+  - Organize with typed API clients, websocket services, reusable hooks, healthcare schemas, and clean component
   boundaries.
   - Include robust error handling, reconnection behavior, and empty/degraded states.
   - Make the app responsive on desktop and mobile.

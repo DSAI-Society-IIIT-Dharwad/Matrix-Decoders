@@ -107,9 +107,6 @@ The intended runtime flow is:
   typed REST and WebSocket client layer for the frontend
 - [frontend/src/audio.ts](/media/raviteja/Volume/nudiscribe/frontend/src/audio.ts)
   AudioWorklet-based raw PCM microphone capture that mirrors `audio_test_client.py`
-- [frontend/src/extraction.ts](/media/raviteja/Volume/nudiscribe/frontend/src/extraction.ts)
-  client-side structured review draft helpers for healthcare and financial/survey modes
-
 These support files are not part of the backend runtime path, but they are still useful for validation and should be kept.
 
 ## Cleanup And Efficiency Changes In This Pass
