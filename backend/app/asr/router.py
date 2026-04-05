@@ -5,7 +5,7 @@ from typing import Set
 
 from .indic_asr import transcribe_indic
 from .segmenter import create_segment_dir, segment_audio
-from .whisper_asr import transcribe_english
+from .whisper_asr import transcribe_with_language
 from ..language import detect_scripts, get_dominant_language, is_code_mixed
 from ..logger import get_logger
 from ..transcript_cleaner import build_segment_metadata, clean_transcript
@@ -21,6 +21,7 @@ class CodeMixedResult:
     languages: Set[str] = field(default_factory=lambda: {"en"})
     is_code_mixed: bool = False
     dominant_language: str = "en"
+    detected_input_language: str = "en"
     segments: list = field(default_factory=list)
 
 
@@ -37,16 +38,37 @@ def _score_text(text: str) -> int:
     return max(0, length_score - penalty)
 
 
-def _merge_transcriptions(whisper_text: str, hi_text: str, kn_text: str) -> tuple[str, Set[str]]:
-    """Pick the best transcription candidate for a single segment."""
-    scores = {
+def _merge_transcriptions(
+    whisper_text: str,
+    hi_text: str,
+    kn_text: str,
+    whisper_detected_lang: str = "en",
+) -> tuple[str, Set[str]]:
+    """Pick the best transcription candidate for a single segment.
+
+    Uses Whisper's detected language as a routing signal to weight
+    scores and prevent cross-language contamination (e.g. English
+    speech being transcribed as Hindi).
+    """
+    base_scores = {
         "whisper": _score_text(whisper_text),
         "hi": _score_text(hi_text),
         "kn": _score_text(kn_text),
     }
 
+    # Apply confidence-weighted multipliers based on Whisper's language detection.
+    # This prevents e.g. Hindi ASR from winning when the speaker is clearly English.
+    scores = dict(base_scores)
+    if whisper_detected_lang == "en":
+        scores["whisper"] = int(scores["whisper"] * 2.0)
+    elif whisper_detected_lang == "hi":
+        scores["hi"] = int(scores["hi"] * 1.5)
+    elif whisper_detected_lang == "kn":
+        scores["kn"] = int(scores["kn"] * 1.5)
+
     log.info(
-        f"Scores - Whisper: {scores['whisper']}, Hindi: {scores['hi']}, Kannada: {scores['kn']}"
+        f"Scores (base) - Whisper: {base_scores['whisper']}, Hindi: {base_scores['hi']}, Kannada: {base_scores['kn']} | "
+        f"Scores (weighted, detected={whisper_detected_lang}) - Whisper: {scores['whisper']}, Hindi: {scores['hi']}, Kannada: {scores['kn']}"
     )
 
     whisper_text = clean_transcript(whisper_text)
@@ -60,6 +82,16 @@ def _merge_transcriptions(whisper_text: str, hi_text: str, kn_text: str) -> tupl
     if whisper_text and is_code_mixed(whisper_text):
         log.info("Code-mixed speech detected in Whisper output")
         return whisper_text, whisper_langs
+
+    # When Whisper confidently detects English and its score is reasonable,
+    # prefer Whisper output to avoid Indic ASR contamination.
+    if whisper_detected_lang == "en" and whisper_text:
+        whisper_is_latin_dominant = (
+            whisper_langs <= {"en"} or whisper_langs <= {"en", "unknown"}
+        )
+        if whisper_is_latin_dominant and scores["whisper"] >= max(scores["hi"], scores["kn"]):
+            log.info("Whisper detected English and output is Latin-dominant — preferring Whisper")
+            return whisper_text, whisper_langs if whisper_langs - {"unknown"} else {"en"}
 
     script_candidates = []
     if hi_text and (hi_langs - {"en"}):
@@ -94,10 +126,16 @@ def _merge_transcriptions(whisper_text: str, hi_text: str, kn_text: str) -> tupl
 class ASRRouter:
     """Routes audio to the best ASR engine(s) and handles code-mixed speech."""
 
-    async def _transcribe_segment(self, audio_path: str) -> tuple[str, Set[str], str]:
+    async def _transcribe_segment(self, audio_path: str) -> tuple[str, Set[str], str, str]:
+        """Transcribe a single audio segment.
+
+        Returns (text, languages, engine, whisper_detected_lang).
+        """
         loop = asyncio.get_event_loop()
 
-        whisper_text = await loop.run_in_executor(None, transcribe_english, audio_path)
+        whisper_text, whisper_detected_lang = await loop.run_in_executor(
+            None, transcribe_with_language, audio_path
+        )
         whisper_text = clean_transcript(whisper_text)
 
         hi_text = await loop.run_in_executor(None, transcribe_indic, audio_path, "hi")
@@ -105,7 +143,9 @@ class ASRRouter:
         hi_text = clean_transcript(hi_text)
         kn_text = clean_transcript(kn_text)
 
-        best_text, languages = _merge_transcriptions(whisper_text, hi_text, kn_text)
+        best_text, languages = _merge_transcriptions(
+            whisper_text, hi_text, kn_text, whisper_detected_lang
+        )
         languages.discard("unknown")
         if not languages:
             languages = {"en"}
@@ -117,7 +157,7 @@ class ASRRouter:
         else:
             engine = "whisper"
 
-        return clean_transcript(best_text), languages, engine
+        return clean_transcript(best_text), languages, engine, whisper_detected_lang
 
     async def transcribe(self, audio_path: str) -> tuple:
         """Transcribe audio, handling code-mixed Hindi-English-Kannada."""
@@ -145,14 +185,19 @@ class ASRRouter:
             all_languages: Set[str] = set()
             transcript_segments: list[dict] = []
 
+            all_whisper_detected: list[str] = []
+
             for audio_segment in audio_segments:
-                text, languages, engine = await self._transcribe_segment(audio_segment.path)
+                text, languages, engine, whisper_detected_lang = await self._transcribe_segment(
+                    audio_segment.path
+                )
                 text = clean_transcript(text)
                 if not text:
                     continue
 
                 merged_text_parts.append(text)
                 all_languages.update(languages)
+                all_whisper_detected.append(whisper_detected_lang)
 
                 segment_languages = sorted(lang for lang in languages if lang != "unknown")
                 if not segment_languages:
@@ -187,6 +232,18 @@ class ASRRouter:
         dominant = get_dominant_language(merged_text, all_languages.copy()) if merged_text else "en"
         mixed = len(all_languages) > 1 or any(segment["is_code_mixed"] for segment in transcript_segments)
 
+        # Determine the detected input language from Whisper's per-segment signals.
+        # If all segments agree, use that; if mixed, mark as code-mixed dominant.
+        if all_whisper_detected:
+            unique_detected = set(all_whisper_detected)
+            if len(unique_detected) == 1:
+                detected_input = unique_detected.pop()
+            else:
+                # Multiple languages detected across segments — use the dominant
+                detected_input = dominant
+        else:
+            detected_input = dominant
+
         if not transcript_segments and merged_text:
             transcript_segments = build_segment_metadata(merged_text)
 
@@ -195,13 +252,15 @@ class ASRRouter:
             languages=all_languages,
             is_code_mixed=mixed,
             dominant_language=dominant,
+            detected_input_language=detected_input,
             segments=transcript_segments,
         )
 
         log.info(
             f"Final: '{result.text[:80]}' | "
             f"Languages: {result.languages} | "
-            f"Code-mixed: {result.is_code_mixed}"
+            f"Code-mixed: {result.is_code_mixed} | "
+            f"Detected input: {result.detected_input_language}"
         )
 
         return result

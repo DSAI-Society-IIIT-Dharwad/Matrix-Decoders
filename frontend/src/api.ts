@@ -77,7 +77,7 @@ export async function clearSession(baseUrl: string, sessionId: string): Promise<
 
 export async function startConsultation(
   baseUrl: string,
-  payload: { session_id: string; consultation_mode: string }
+  payload: { session_id: string; consultation_mode: string; response_language?: string }
 ): Promise<ChatResponse> {
   return requestJson<ChatResponse>(baseUrl, "/api/consultation/start", {
     method: "POST",
@@ -180,6 +180,7 @@ export async function streamTextChat(
     text: string;
     speaker_role?: string;
     consultation_mode: string;
+    response_language?: string;
   },
   onEvent: (event: TextStreamEvent) => void
 ): Promise<FinalEvent> {
@@ -275,7 +276,10 @@ export function createAudioSocketSession(
         sample_width: config.sample_width,
         encoding: config.encoding,
         consultation_mode: config.consultation_mode,
-        speaker_role: config.speaker_role
+        speaker_role: config.speaker_role,
+        response_language: config.response_language,
+        turn_timeout_seconds: config.turn_timeout_seconds,
+        transcription_only: config.transcription_only
       })
     );
   });
@@ -289,6 +293,7 @@ export function createAudioSocketSession(
       }
       if (
         payload.type === "final" ||
+        payload.type === "stream_complete" ||
         payload.type === "audio_skipped" ||
         payload.type === "error"
       ) {

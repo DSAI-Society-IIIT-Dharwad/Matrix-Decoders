@@ -583,6 +583,31 @@ textarea {
   background: rgba(21, 91, 117, 0.1);
   color: var(--accent-strong);
   border: 1px solid rgba(21, 91, 117, 0.22);
+  transition: background 200ms ease, color 200ms ease, border-color 200ms ease;
+}
+
+.lang-badge-en {
+  background: rgba(37, 99, 235, 0.12);
+  color: #1e40af;
+  border-color: rgba(37, 99, 235, 0.28);
+}
+
+.lang-badge-hi {
+  background: rgba(234, 88, 12, 0.12);
+  color: #c2410c;
+  border-color: rgba(234, 88, 12, 0.28);
+}
+
+.lang-badge-kn {
+  background: rgba(22, 163, 74, 0.12);
+  color: #15803d;
+  border-color: rgba(22, 163, 74, 0.28);
+}
+
+.lang-badge-mixed {
+  background: rgba(147, 51, 234, 0.12);
+  color: #7e22ce;
+  border-color: rgba(147, 51, 234, 0.28);
 }
 
 .mode-toggle {

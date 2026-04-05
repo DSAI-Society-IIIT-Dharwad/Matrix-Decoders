@@ -49,7 +49,7 @@ def trim_pcm16_silence(
     channels: int = 1,
     silence_threshold: int = 550,
 ) -> bytes:
-    """Trim low-energy leading and trailing silence from PCM16 audio."""
+    """Trim leading/trailing silence using adaptive thresholding on PCM16 audio."""
     if not pcm_bytes:
         return pcm_bytes
 
@@ -57,20 +57,38 @@ def trim_pcm16_silence(
     if len(pcm_bytes) < frame_size:
         return b""
 
+    amplitudes: list[int] = []
+    for start in range(0, len(pcm_bytes), frame_size):
+        frame = pcm_bytes[start:start + frame_size]
+        if len(frame) < frame_size:
+            break
+        samples = memoryview(frame).cast("h")
+        amplitudes.append(max(abs(sample) for sample in samples))
+
+    if not amplitudes:
+        return b""
+
+    amplitudes_sorted = sorted(amplitudes)
+    noise_floor = amplitudes_sorted[int(len(amplitudes_sorted) * 0.20)]
+    speech_peak = amplitudes_sorted[int(len(amplitudes_sorted) * 0.90)]
+    dynamic_range = max(speech_peak - noise_floor, 1)
+    adaptive_threshold = int(noise_floor + dynamic_range * 0.25)
+    threshold = max(silence_threshold, adaptive_threshold)
+
     start = 0
     end = len(pcm_bytes)
 
     while start + frame_size <= end:
         frame = pcm_bytes[start:start + frame_size]
         samples = memoryview(frame).cast("h")
-        if max(abs(sample) for sample in samples) >= silence_threshold:
+        if max(abs(sample) for sample in samples) >= threshold:
             break
         start += frame_size
 
     while end - frame_size >= start:
         frame = pcm_bytes[end - frame_size:end]
         samples = memoryview(frame).cast("h")
-        if max(abs(sample) for sample in samples) >= silence_threshold:
+        if max(abs(sample) for sample in samples) >= threshold:
             break
         end -= frame_size
 

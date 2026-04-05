@@ -227,6 +227,14 @@ async def _run_text_ws_check(
                 raw_message = await asyncio.wait_for(websocket.recv(), timeout=timeout_seconds)
                 payload = json.loads(raw_message)
                 message_type = payload.get("type")
+                if message_type == "stream_started":
+                    continue
+                if message_type == "stream_complete" and payload.get("status") not in {"ok", "started"}:
+                    return CheckResult(
+                        name="WebSocket /ws/{session_id}",
+                        passed=False,
+                        detail=f"stream_complete status={payload.get('status')}",
+                    )
                 if message_type == "delta":
                     received_delta = True
                 if message_type == "final":
@@ -291,6 +299,14 @@ async def _run_tts_ws_check(
                 raw_message = await asyncio.wait_for(websocket.recv(), timeout=timeout_seconds)
                 payload = json.loads(raw_message)
                 message_type = payload.get("type")
+                if message_type == "stream_started":
+                    continue
+                if message_type == "stream_complete" and payload.get("status") not in {"ok", "started"}:
+                    return CheckResult(
+                        name="WebSocket /ws/tts/{session_id}",
+                        passed=False,
+                        detail=f"stream_complete status={payload.get('status')}",
+                    )
 
                 if message_type == "audio_chunk":
                     chunk_count += 1
@@ -396,6 +412,14 @@ async def _run_audio_ws_check(
                 raw_message = await asyncio.wait_for(websocket.recv(), timeout=timeout_seconds)
                 payload = json.loads(raw_message)
                 message_type = payload.get("type")
+                if message_type == "stream_started":
+                    continue
+                if message_type == "stream_complete" and payload.get("status") not in {"ok", "started"}:
+                    return CheckResult(
+                        name="WebSocket /ws/audio/{session_id}",
+                        passed=False,
+                        detail=f"stream_complete status={payload.get('status')}",
+                    )
                 if message_type == "transcription":
                     saw_transcription = True
                 elif message_type == "final":

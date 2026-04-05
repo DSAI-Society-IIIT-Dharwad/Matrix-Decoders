@@ -20,10 +20,6 @@ def choose_response_language(
     if preferred_language in _SUPPORTED_RESPONSE_LANGUAGES:
         return preferred_language
 
-    default_language = settings.default_response_language
-    if default_language in _SUPPORTED_RESPONSE_LANGUAGES:
-        return default_language
-
     normalized_languages = _normalize_languages(detected_languages)
     if normalized_languages:
         dominant = get_dominant_language(response_text, normalized_languages.copy())
@@ -36,6 +32,10 @@ def choose_response_language(
         dominant = get_dominant_language(response_text, inferred_languages.copy())
         if dominant in _SUPPORTED_RESPONSE_LANGUAGES:
             return dominant
+
+    default_language = settings.default_response_language
+    if default_language in _SUPPORTED_RESPONSE_LANGUAGES:
+        return default_language
 
     return "en"
 

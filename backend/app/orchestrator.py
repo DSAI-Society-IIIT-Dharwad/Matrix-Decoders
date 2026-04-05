@@ -37,7 +37,7 @@ class Orchestrator:
         self,
         consultation_turns: list[dict[str, object]],
         transcript_records: list[dict[str, object]] | None = None,
-        timeout_seconds: float = 6.0,
+        timeout_seconds: float = 3.0,
     ) -> dict[str, object]:
         transcript_records = transcript_records or []
         source_lines: list[str] = []
@@ -91,6 +91,7 @@ class Orchestrator:
         languages: set | None = None,
         speaker_role_hint: str | None = None,
         consultation_mode: str = "consultation",
+        preferred_response_language: str | None = None,
     ):
         text = clean_transcript(text)
         if not text:
@@ -107,7 +108,11 @@ class Orchestrator:
         dominant_lang = get_dominant_language(text, languages.copy())
         code_mixed = len(languages - {"unknown"}) > 1
         store.track_languages(session_id, languages)
-        fallback_language = choose_response_language(text, languages)
+        response_language = choose_response_language(
+            text,
+            languages,
+            preferred_language=preferred_response_language,
+        )
 
         yield {
             "type": "language_info",
@@ -125,19 +130,20 @@ class Orchestrator:
             consultation_turns,
             transcript_records=(session_snapshot or {}).get("transcripts", []),
         )
-        dynamic_structured_report = await self._extract_dynamic_report(
-            consultation_turns,
-            transcript_records=list((session_snapshot or {}).get("transcripts", [])),
-        )
-        structured_report = merge_structured_report_overrides(structured_report, dynamic_structured_report)
         knowledge_hits = select_healthcare_resources([turn.get("text", "") for turn in consultation_turns])
-        suggested_questions = build_follow_up_questions(structured_report, speaker_role, consultation_mode)
+        suggested_questions = build_follow_up_questions(
+            structured_report,
+            speaker_role,
+            consultation_mode,
+            response_language=response_language,
+        )
         messages = build_healthcare_messages(
             history_before,
             text,
             languages=languages,
             speaker_role=speaker_role,
             consultation_mode=consultation_mode,
+            response_language=response_language,
             structured_report=structured_report,
             knowledge_hits=knowledge_hits,
             suggested_questions=suggested_questions,
@@ -155,7 +161,7 @@ class Orchestrator:
                         consultation_mode=consultation_mode,
                         report=structured_report,
                         knowledge_hits=knowledge_hits,
-                        response_language=fallback_language,
+                        response_language=response_language,
                     )
                     yield {"type": "delta", "text": response_text}
                     break
@@ -170,7 +176,7 @@ class Orchestrator:
                 consultation_mode=consultation_mode,
                 report=structured_report,
                 knowledge_hits=knowledge_hits,
-                response_language=fallback_language,
+                response_language=response_language,
             )
             yield {"type": "delta", "text": response_text}
 
@@ -181,7 +187,7 @@ class Orchestrator:
                 consultation_mode=consultation_mode,
                 report=structured_report,
                 knowledge_hits=knowledge_hits,
-                response_language=fallback_language,
+                response_language=response_language,
             )
         else:
             response_text = shape_assistant_response(
@@ -190,7 +196,7 @@ class Orchestrator:
                 consultation_mode=consultation_mode,
                 report=structured_report,
                 knowledge_hits=knowledge_hits,
-                response_language=fallback_language,
+                response_language=response_language,
             )
 
         log.info(
@@ -211,10 +217,19 @@ class Orchestrator:
         )
         final_report = merge_structured_report_overrides(final_report, final_dynamic_report)
         final_knowledge_hits = select_healthcare_resources([turn.get("text", "") for turn in final_turns])
-        final_questions = build_follow_up_questions(final_report, speaker_role, consultation_mode)
+        final_questions = build_follow_up_questions(
+            final_report,
+            speaker_role,
+            consultation_mode,
+            response_language=response_language,
+        )
 
         sentences = split_sentences(response_text)
-        tts_language = choose_response_language(response_text, languages)
+        tts_language = choose_response_language(
+            response_text,
+            languages,
+            preferred_language=response_language,
+        )
         tts_segments = []
         for sentence in sentences:
             sentence_languages = detect_scripts(sentence)
@@ -256,6 +271,7 @@ class Orchestrator:
         audio_path: str,
         consultation_mode: str = "consultation",
         speaker_role_hint: str | None = None,
+        preferred_response_language: str | None = None,
     ):
         log.info("Starting healthcare audio pipeline...")
 
@@ -279,6 +295,7 @@ class Orchestrator:
                 "type": "transcription",
                 "text": result.text,
                 "language": result.dominant_language,
+                "detected_input_language": result.detected_input_language,
                 "languages": list(result.languages),
                 "is_code_mixed": result.is_code_mixed,
                 "segments": result.segments,
@@ -292,6 +309,7 @@ class Orchestrator:
                 result.languages,
                 speaker_role_hint=speaker_role,
                 consultation_mode=consultation_mode,
+                preferred_response_language=preferred_response_language,
             ):
                 yield event
 

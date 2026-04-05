@@ -245,6 +245,12 @@ GUIDANCE_CUES = {
     "kn": ("ವಿಶ್ರಾಂತಿ", "ನೀರು", "ಗಮನಿಸಿ", "ವೈದ್ಯರನ್ನು ಸಂಪರ್ಕಿಸಿ", "ಸಲಹೆ"),
 }
 
+LANGUAGE_NAMES = {
+    "en": "English",
+    "hi": "Hindi",
+    "kn": "Kannada",
+}
+
 
 def normalize_speaker_role(role: Optional[str], fallback: str = "patient") -> str:
     normalized = clean_transcript(str(role or "")).lower().replace(" ", "_")
@@ -262,6 +268,46 @@ def normalize_consultation_mode(mode: Optional[str]) -> str:
     if normalized in VALID_CONSULTATION_MODES:
         return normalized
     return "consultation"
+
+
+def _language_label(language: str) -> str:
+    return LANGUAGE_NAMES.get(language, language.upper() if language else "English")
+
+
+def _has_target_language_script(text: str, target_language: str) -> bool:
+    if target_language not in {"en", "hi", "kn"}:
+        return False
+
+    scripts = detect_scripts(text)
+    scripts.discard("unknown")
+    if not scripts:
+        return False
+
+    if target_language == "en":
+        return scripts <= {"en"}
+
+    return scripts == {target_language}
+
+
+def _strip_role_markers(text: str) -> str:
+    cleaned = re.sub(r"(?i)\b(?:doctor|patient|assistant|user)\s*turn\s*:\s*", "", text)
+    cleaned = re.sub(r"(?i)\b(?:doctor|patient|assistant|user)\s*:\s*", "", cleaned)
+    return clean_transcript(cleaned)
+
+
+def _last_question_from_history(history_messages: Optional[Iterable[dict]] = None) -> str:
+    for message in reversed(list(history_messages or [])):
+        role = normalize_speaker_role(message.get("role"), fallback="")
+        if role not in {"assistant", "doctor"}:
+            continue
+        content = clean_transcript(str(message.get("content", "")))
+        if not content:
+            continue
+        sentences = _split_sentences(content)
+        for sentence in reversed(sentences):
+            if "?" in sentence:
+                return sentence
+    return ""
 
 
 def infer_speaker_role(
@@ -478,6 +524,17 @@ def _sanitize_assistant_response(text: str) -> str:
     return clean_transcript(" ".join(sentences))
 
 
+def _can_echo_text(text: str, target_language: str) -> bool:
+    cleaned = clean_transcript(text)
+    if not cleaned or target_language not in {"en", "hi", "kn"}:
+        return False
+    scripts = detect_scripts(cleaned)
+    scripts.discard("unknown")
+    if not scripts:
+        return False
+    return scripts == {target_language}
+
+
 def _extract_by_keywords(sentences: Iterable[str], keywords: Iterable[str]) -> str:
     keyword_list = [keyword.lower() for keyword in keywords]
     matches = [
@@ -637,6 +694,7 @@ def build_follow_up_questions(
     report: dict[str, object],
     speaker_role: str,
     consultation_mode: str,
+    response_language: str = "en",
 ) -> list[str]:
     questions = list(report.get("pending_questions", []))
     if consultation_mode == "follow_up":
@@ -649,7 +707,7 @@ def build_follow_up_questions(
         questions = [
             "Please confirm the working diagnosis and treatment advice for documentation."
         ] + questions
-    return _unique_sentences(questions)[:4]
+    return _localize_follow_up_questions(_unique_sentences(questions)[:4], response_language)
 
 
 def build_deterministic_response(
@@ -689,30 +747,68 @@ def build_deterministic_response(
     diagnosis = clean_transcript(
         str(report.get("diagnosis", "") or report.get("diagnosis_classification_status", ""))
     )
+    complaint_echo = complaint if _can_echo_text(complaint, target_language) else ""
+    symptoms_echo = symptoms if _can_echo_text(symptoms, target_language) else ""
+
+    if consultation_mode == "follow_up":
+        if target_language == "hi":
+            lead = "यह स्वास्थ्य फॉलो-अप जाँच है।"
+        elif target_language == "kn":
+            lead = "ಇದು ಆರೋಗ್ಯ ಫಾಲೋ-ಅಪ್ ಪರಿಶೀಲನೆ."
+        else:
+            lead = "This is a healthcare follow-up check."
+        response = " ".join(part for part in (lead, consultation_guidance) if part).strip()
+        return _limit_response_sentences(response, max_sentences=2, max_questions=0)
+
+    if speaker_role == "doctor":
+        if target_language == "hi":
+            response = "डॉक्टर का इनपुट दर्ज हो गया है। मैं परामर्श रिपोर्ट अपडेट कर रहा हूँ।"
+        elif target_language == "kn":
+            response = "ವೈದ್ಯರ ಇನ್‌ಪುಟ್ ದಾಖಲಾಗಿದೆ. ನಾನು ಸಮಾಲೋಚನೆ ವರದಿಯನ್ನು ನವೀಕರಿಸುತ್ತಿದ್ದೇನೆ."
+        else:
+            response = "Doctor input captured. I will update the consultation report."
+        return _limit_response_sentences(response, max_sentences=2, max_questions=0)
 
     if target_language == "hi":
         if diagnosis:
             lead = f"संभावित समस्या: {diagnosis}."
-        elif complaint or symptoms:
-            lead = "बताए गए लक्षणों के लिए यह संक्षिप्त सलाह है।"
+        elif complaint_echo:
+            lead = f"मुख्य शिकायत दर्ज की गई है: {complaint_echo}."
+        elif symptoms_echo:
+            lead = f"बताए गए लक्षण दर्ज किए गए हैं: {symptoms_echo}."
         else:
             lead = "अभी के लिए संक्षिप्त सलाह यह है।"
     elif target_language == "kn":
         if diagnosis:
             lead = f"ಸಂಭಾವ್ಯ ಸಮಸ್ಯೆ: {diagnosis}."
-        elif complaint or symptoms:
-            lead = "ಹೇಳಿದ ಲಕ್ಷಣಗಳಿಗೆ ಇದು ಸಂಕ್ಷಿಪ್ತ ಸಲಹೆ."
+        elif complaint_echo:
+            lead = f"ಮುಖ್ಯ ತೊಂದರೆಯನ್ನು ದಾಖಲಿಸಲಾಗಿದೆ: {complaint_echo}."
+        elif symptoms_echo:
+            lead = f"ಹೇಳಿದ ಲಕ್ಷಣಗಳನ್ನು ದಾಖಲಿಸಲಾಗಿದೆ: {symptoms_echo}."
         else:
             lead = "ಈಗಕ್ಕೆ ಸಂಕ್ಷಿಪ್ತ ಸಲಹೆ ಇದು."
     else:
         if diagnosis:
             lead = f"Probable issue: {diagnosis}."
+        elif complaint_echo:
+            lead = f"I captured the main complaint: {complaint_echo}."
+        elif symptoms_echo:
+            lead = f"I captured the reported symptoms: {symptoms_echo}."
         elif complaint or symptoms:
             lead = "For the reported symptoms, this is the brief probable solution."
         else:
             lead = "This is the brief probable solution for now."
 
-    response = " ".join(part for part in (lead, consultation_guidance) if part).strip()
+    knowledge_summary = (
+        clean_transcript(str((knowledge_hits[0] or {}).get("summary", ""))) if knowledge_hits else ""
+    )
+    knowledge_line = ""
+    if knowledge_summary and target_language == "en":
+        knowledge_line = f"Relevant public healthcare context: {knowledge_summary}."
+
+    response = " ".join(
+        part for part in (lead, knowledge_line, consultation_guidance) if part
+    ).strip()
     return _limit_response_sentences(response, max_sentences=2, max_questions=0)
 
 
@@ -728,6 +824,7 @@ def build_consultation_guidance(
     symptom_text = clean_transcript(
         str(report.get("symptoms", "") or report.get("complaint_query", ""))
     )
+    symptom_echo = symptom_text if _can_echo_text(symptom_text, target_language) else ""
 
     if advice:
         if target_language == "hi":
@@ -741,15 +838,15 @@ def build_consultation_guidance(
 
     if consultation_mode == "follow_up":
         if target_language == "hi":
-            if symptom_text:
-                return f"{symptom_text} पर निगरानी रखें, दवाइयाँ नियमित लें, और लक्षण बढ़ें तो डॉक्टर से तुरंत संपर्क करें।"
+            if symptom_echo:
+                return f"{symptom_echo} पर निगरानी रखें, दवाइयाँ नियमित लें, और लक्षण बढ़ें तो डॉक्टर से तुरंत संपर्क करें।"
             return "दवाइयाँ नियमित लें, आराम करें, और लक्षण बढ़ें तो डॉक्टर से तुरंत संपर्क करें।"
         if target_language == "kn":
-            if symptom_text:
-                return f"{symptom_text} ಅನ್ನು ಗಮನಿಸಿ, ಔಷಧಿಗಳನ್ನು ನಿಯಮಿತವಾಗಿ ತೆಗೆದುಕೊಳ್ಳಿ, ಮತ್ತು ಲಕ್ಷಣಗಳು ಹೆಚ್ಚಾದರೆ ತಕ್ಷಣ ವೈದ್ಯರನ್ನು ಸಂಪರ್ಕಿಸಿ."
+            if symptom_echo:
+                return f"{symptom_echo} ಅನ್ನು ಗಮನಿಸಿ, ಔಷಧಿಗಳನ್ನು ನಿಯಮಿತವಾಗಿ ತೆಗೆದುಕೊಳ್ಳಿ, ಮತ್ತು ಲಕ್ಷಣಗಳು ಹೆಚ್ಚಾದರೆ ತಕ್ಷಣ ವೈದ್ಯರನ್ನು ಸಂಪರ್ಕಿಸಿ."
             return "ಔಷಧಿಗಳನ್ನು ನಿಯಮಿತವಾಗಿ ತೆಗೆದುಕೊಳ್ಳಿ, ವಿಶ್ರಾಂತಿ ಮಾಡಿ, ಮತ್ತು ಲಕ್ಷಣಗಳು ಹೆಚ್ಚಾದರೆ ತಕ್ಷಣ ವೈದ್ಯರನ್ನು ಸಂಪರ್ಕಿಸಿ."
-        if symptom_text:
-            return f"Monitor {symptom_text}, continue the advised medicines, and seek clinical review if symptoms worsen."
+        if symptom_echo:
+            return f"Monitor {symptom_echo}, continue the advised medicines, and seek clinical review if symptoms worsen."
         return "Continue the advised medicines and seek clinical review if symptoms worsen."
 
     if target_language == "hi":
@@ -774,7 +871,7 @@ def shape_assistant_response(
     response_language: str = "en",
 ) -> str:
     target_language = response_language if response_language in {"en", "hi", "kn"} else "en"
-    cleaned = _sanitize_assistant_response(text)
+    cleaned = _sanitize_assistant_response(_strip_role_markers(text))
     if not cleaned:
         return build_deterministic_response(
             speaker_role=speaker_role,
@@ -783,12 +880,26 @@ def shape_assistant_response(
             knowledge_hits=knowledge_hits,
             response_language=target_language,
         )
-    if (
-        "{" in text
-        or "}" in text
-        or "json" in text.lower()
-        or not response_contains_guidance(cleaned, target_language)
-    ):
+
+    if target_language in {"hi", "kn"} and not _has_target_language_script(cleaned, target_language):
+        return build_deterministic_response(
+            speaker_role=speaker_role,
+            consultation_mode=consultation_mode,
+            report=report,
+            knowledge_hits=knowledge_hits,
+            response_language=target_language,
+        )
+
+    if consultation_mode == "follow_up" and speaker_role == "patient":
+        guidance = build_consultation_guidance(
+            report,
+            knowledge_hits,
+            response_language=target_language,
+            consultation_mode=consultation_mode,
+        )
+        if guidance and not response_contains_guidance(cleaned, target_language):
+            cleaned = f"{guidance} {cleaned}"
+    elif not response_contains_guidance(cleaned, target_language):
         return build_deterministic_response(
             speaker_role=speaker_role,
             consultation_mode=consultation_mode,
@@ -869,19 +980,36 @@ def _localize_follow_up_questions(questions: list[str], language: str) -> list[s
     return [translations.get(question, {}).get(language, question) for question in questions]
 
 
-def build_opening_assistant_prompt(consultation_mode: str) -> str:
+def build_opening_assistant_prompt(consultation_mode: str, response_language: str = "en") -> str:
+    target_language = response_language if response_language in {"en", "hi", "kn"} else "en"
     if consultation_mode == "follow_up":
+        if target_language == "hi":
+            return (
+                "यह फॉलो-अप जाँच है। पिछली मुलाकात के बाद मरीज बेहतर है, वैसा ही है, या खराब हुआ है? "
+                "क्या दवाइयाँ बताई गई तरह ली जा रही हैं?"
+            )
+        if target_language == "kn":
+            return (
+                "ಇದು ಫಾಲೋ-ಅಪ್ ಪರಿಶೀಲನೆ. ಹಿಂದಿನ ಭೇಟಿಯ ನಂತರ ರೋಗಿ ಉತ್ತಮವಾಗಿದ್ದಾನೆಯೆ, ಅದೇ ರೀತಿಯಲ್ಲಿದ್ದಾನೆಯೆ, ಅಥವಾ ಕೆಟ್ಟಿದ್ದಾನೆಯೆ? "
+                "ಔಷಧಿಗಳನ್ನು ಸೂಚಿಸಿದಂತೆ ತೆಗೆದುಕೊಳ್ಳುತ್ತಿದ್ದಾರೆಯೆ?"
+            )
         return (
             "Please briefly share whether the patient is better, the same, or worse since the last consultation and whether medicines are being taken as advised."
         )
-    return (
-        "Please briefly describe the main symptom, when it started, and any regular medicines or past medical history."
-    )
+
+    if target_language == "hi":
+        return "कृपया मुख्य समस्या, यह कब से शुरू हुई, और कोई नियमित दवाइयाँ या पुरानी बीमारियाँ बताइए।"
+    if target_language == "kn":
+        return "ದಯವಿಟ್ಟು ಮುಖ್ಯ ಸಮಸ್ಯೆ, ಅದು ಯಾವಾಗಿನಿಂದ ಆರಂಭವಾಗಿದೆ, ಮತ್ತು ಯಾವುದೇ ನಿಯಮಿತ ಔಷಧಿಗಳು ಅಥವಾ ಹಿಂದಿನ ಕಾಯಿಲೆಗಳು ಇದ್ದರೆ ತಿಳಿಸಿ."
+    return "Please briefly describe the main symptom, when it started, and any regular medicines or past medical history."
 
 
 def derive_consultation_snapshot(session_snapshot: Optional[dict]) -> dict[str, object]:
     turns = build_consultation_turns(session_snapshot)
     transcript_records = list((session_snapshot or {}).get("transcripts", []))
+    selected_language = str((session_snapshot or {}).get("selected_language", "en"))
+    if selected_language not in {"en", "hi", "kn"}:
+        selected_language = "en"
     document_texts = [
         str(record.get("text", ""))
         for record in transcript_records
@@ -895,5 +1023,10 @@ def derive_consultation_snapshot(session_snapshot: Optional[dict]) -> dict[str, 
         "consultation_turns": turns,
         "structured_report": report,
         "knowledge_hits": knowledge_hits,
-        "suggested_questions": build_follow_up_questions(report, "patient", "consultation"),
+        "suggested_questions": build_follow_up_questions(
+            report,
+            "patient",
+            "consultation",
+            response_language=selected_language,
+        ),
     }

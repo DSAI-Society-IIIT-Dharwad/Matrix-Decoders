@@ -1,9 +1,34 @@
 const DEFAULT_SAMPLE_RATE = 16000;
 const STREAM_CHUNK_SECONDS = 0.25;
+const VAD_PRE_ROLL_SECONDS = 0.45;
+const VAD_WARMUP_SECONDS = 0.35;
+const VAD_START_SECONDS = 0.06;
+const VAD_HANGOVER_SECONDS = 0.22;
+const VAD_BASE_NOISE_FLOOR = 0.003;
+const VAD_ENTER_MULTIPLIER = 2.9;
+const VAD_EXIT_MULTIPLIER = 1.7;
+const VAD_ENTER_OFFSET = 0.0015;
+const VAD_EXIT_OFFSET = 0.0009;
+const VAD_NOISE_ALPHA = 0.025;
+
+export type VoiceActivityPhase = "calibrating" | "listening" | "speech";
+
+export interface VoiceActivityState {
+  phase: VoiceActivityPhase;
+  isSpeech: boolean;
+  rms: number;
+  noiseFloor: number;
+  enterThreshold: number;
+  exitThreshold: number;
+  speechMs: number;
+  silenceMs: number;
+  confidence: number;
+}
 
 type CaptureCallbacks = {
   onChunk: (chunk: ArrayBuffer) => void;
   onLevel?: (rms: number) => void;
+  onVadState?: (state: VoiceActivityState) => void;
 };
 
 type PreparedCapture = {
@@ -87,9 +112,21 @@ export class BrowserAudioCapture {
   private samplesPerChunk = DEFAULT_SAMPLE_RATE * STREAM_CHUNK_SECONDS;
   private pendingChunks: Int16Array[] = [];
   private pendingSamples = 0;
+  private preRollChunks: Int16Array[] = [];
+  private preRollSamples = 0;
   private capturedChunks: ArrayBuffer[] = [];
   private callbacks: CaptureCallbacks | null = null;
   private startedAt = 0;
+  private vadWarmupMs = 0;
+  private vadSpeechMs = 0;
+  private vadSilenceMs = 0;
+  private vadNoiseFloor = VAD_BASE_NOISE_FLOOR;
+  private vadPhase: VoiceActivityPhase = "calibrating";
+  private vadRms = 0;
+  private vadEnterThreshold = VAD_BASE_NOISE_FLOOR;
+  private vadExitThreshold = VAD_BASE_NOISE_FLOOR;
+  private vadPotentialSpeech = false;
+  private lastEmittedPhase: VoiceActivityPhase | null = null;
 
   async prepare(): Promise<PreparedCapture> {
     if (this.prepared) {
@@ -139,18 +176,29 @@ export class BrowserAudioCapture {
           ? payload.samples
           : new Float32Array(payload.samples);
       const chunk = float32ToInt16(samples);
+      const rms = Number(payload.rms || 0);
       this.capturedChunks.push(clonePcmBuffer(chunk));
-      this.pendingChunks.push(chunk);
-      this.pendingSamples += chunk.length;
 
       if (this.callbacks?.onLevel) {
-        this.callbacks.onLevel(Number(payload.rms || 0));
+        this.callbacks.onLevel(rms);
       }
 
-      while (this.pendingSamples >= this.samplesPerChunk) {
-        const pcmChunk = this.consumeSamples(this.samplesPerChunk);
-        this.callbacks?.onChunk(clonePcmBuffer(pcmChunk));
+      this.ingestVadFrame(chunk, rms);
+
+      if (this.vadPhase === "speech") {
+        this.pendingChunks.push(chunk);
+        this.pendingSamples += chunk.length;
+
+        while (this.pendingSamples >= this.samplesPerChunk) {
+          const pcmChunk = this.consumeSamples(this.samplesPerChunk);
+          this.callbacks?.onChunk(clonePcmBuffer(pcmChunk));
+        }
+        return;
       }
+
+      this.preRollChunks.push(chunk);
+      this.preRollSamples += chunk.length;
+      this.trimPreRoll();
     };
 
     this.prepared = true;
@@ -171,7 +219,19 @@ export class BrowserAudioCapture {
     this.callbacks = callbacks;
     this.pendingChunks = [];
     this.pendingSamples = 0;
+    this.preRollChunks = [];
+    this.preRollSamples = 0;
     this.capturedChunks = [];
+    this.vadWarmupMs = 0;
+    this.vadSpeechMs = 0;
+    this.vadSilenceMs = 0;
+    this.vadNoiseFloor = VAD_BASE_NOISE_FLOOR;
+    this.vadPhase = "calibrating";
+    this.vadRms = 0;
+    this.vadEnterThreshold = VAD_BASE_NOISE_FLOOR;
+    this.vadExitThreshold = VAD_BASE_NOISE_FLOOR;
+    this.vadPotentialSpeech = false;
+    this.lastEmittedPhase = null;
 
     await this.audioContext.resume();
     this.sourceNode.connect(this.processorNode);
@@ -179,6 +239,8 @@ export class BrowserAudioCapture {
     this.sinkNode.connect(this.audioContext.destination);
     this.recording = true;
     this.startedAt = performance.now();
+
+    this.emitVadState(true);
 
     return prepared;
   }
@@ -193,6 +255,9 @@ export class BrowserAudioCapture {
     }
 
     if (this.recording) {
+      if (this.vadPhase === "speech" || this.vadPotentialSpeech) {
+        this.flushPreRollToPending();
+      }
       while (this.pendingSamples > 0) {
         const pcmChunk = this.consumeSamples(this.pendingSamples);
         this.callbacks?.onChunk(clonePcmBuffer(pcmChunk));
@@ -232,6 +297,20 @@ export class BrowserAudioCapture {
     this.sinkNode = null;
     this.prepared = false;
     this.startedAt = 0;
+    this.pendingChunks = [];
+    this.pendingSamples = 0;
+    this.preRollChunks = [];
+    this.preRollSamples = 0;
+    this.vadWarmupMs = 0;
+    this.vadSpeechMs = 0;
+    this.vadSilenceMs = 0;
+    this.vadNoiseFloor = VAD_BASE_NOISE_FLOOR;
+    this.vadPhase = "calibrating";
+    this.vadRms = 0;
+    this.vadEnterThreshold = VAD_BASE_NOISE_FLOOR;
+    this.vadExitThreshold = VAD_BASE_NOISE_FLOOR;
+    this.vadPotentialSpeech = false;
+    this.lastEmittedPhase = null;
 
     return {
       blob,
@@ -245,6 +324,139 @@ export class BrowserAudioCapture {
       return 0;
     }
     return (performance.now() - this.startedAt) / 1000;
+  }
+
+  private ingestVadFrame(chunk: Int16Array, rms: number) {
+    const frameDurationMs = (chunk.length / Math.max(this.sampleRate, 1)) * 1000;
+    this.vadRms = rms;
+
+    if (this.vadWarmupMs < VAD_WARMUP_SECONDS * 1000) {
+      this.vadWarmupMs += frameDurationMs;
+      this.vadNoiseFloor = this.vadNoiseFloor * 0.9 + Math.max(rms, VAD_BASE_NOISE_FLOOR) * 0.1;
+      this.vadEnterThreshold = Math.max(
+        VAD_BASE_NOISE_FLOOR,
+        this.vadNoiseFloor * VAD_ENTER_MULTIPLIER + VAD_ENTER_OFFSET
+      );
+      this.vadExitThreshold = Math.max(
+        VAD_BASE_NOISE_FLOOR * 0.8,
+        this.vadNoiseFloor * VAD_EXIT_MULTIPLIER + VAD_EXIT_OFFSET
+      );
+      this.vadPhase = "calibrating";
+      this.emitVadState();
+      return;
+    }
+
+    if (rms < this.vadNoiseFloor * 1.3) {
+      this.vadNoiseFloor = this.vadNoiseFloor * (1 - VAD_NOISE_ALPHA) + rms * VAD_NOISE_ALPHA;
+    }
+
+    this.vadEnterThreshold = Math.max(
+      VAD_BASE_NOISE_FLOOR,
+      this.vadNoiseFloor * VAD_ENTER_MULTIPLIER + VAD_ENTER_OFFSET
+    );
+    this.vadExitThreshold = Math.max(
+      VAD_BASE_NOISE_FLOOR * 0.8,
+      this.vadNoiseFloor * VAD_EXIT_MULTIPLIER + VAD_EXIT_OFFSET
+    );
+
+    if (this.vadPhase === "speech") {
+      this.vadSpeechMs += frameDurationMs;
+      if (rms >= this.vadExitThreshold) {
+        this.vadSilenceMs = 0;
+      } else {
+        this.vadSilenceMs += frameDurationMs;
+      }
+
+      if (this.vadSilenceMs >= VAD_HANGOVER_SECONDS * 1000) {
+        this.vadPhase = "listening";
+        this.vadSpeechMs = 0;
+        this.vadSilenceMs = 0;
+        this.vadPotentialSpeech = false;
+      }
+      this.emitVadState();
+      return;
+    }
+
+    if (rms >= this.vadEnterThreshold) {
+      this.vadPotentialSpeech = true;
+    }
+
+    if (rms >= this.vadEnterThreshold) {
+      this.vadSpeechMs += frameDurationMs;
+    } else {
+      this.vadSpeechMs = 0;
+    }
+
+    if (this.vadSpeechMs >= VAD_START_SECONDS * 1000) {
+      this.vadPhase = "speech";
+      this.vadSilenceMs = 0;
+      this.flushPreRollToPending();
+      this.vadPotentialSpeech = false;
+    } else {
+      this.vadPhase = "listening";
+    }
+
+    this.emitVadState();
+  }
+
+  private flushPreRollToPending() {
+    if (this.preRollChunks.length === 0) {
+      return;
+    }
+
+    for (const chunk of this.preRollChunks) {
+      this.pendingChunks.push(chunk);
+      this.pendingSamples += chunk.length;
+    }
+
+    this.preRollChunks = [];
+    this.preRollSamples = 0;
+  }
+
+  private trimPreRoll() {
+    const maxPreRollSamples = Math.max(
+      Math.floor(this.sampleRate * VAD_PRE_ROLL_SECONDS),
+      this.samplesPerChunk
+    );
+
+    while (this.preRollSamples > maxPreRollSamples && this.preRollChunks.length > 0) {
+      const head = this.preRollChunks.shift();
+      if (!head) {
+        break;
+      }
+      this.preRollSamples -= head.length;
+    }
+  }
+
+  private emitVadState(force = false) {
+    if (!this.callbacks?.onVadState) {
+      return;
+    }
+
+    if (!force && this.lastEmittedPhase === this.vadPhase) {
+      return;
+    }
+
+    this.lastEmittedPhase = this.vadPhase;
+    this.callbacks.onVadState({
+      phase: this.vadPhase,
+      isSpeech: this.vadPhase === "speech",
+      rms: this.vadRms,
+      noiseFloor: this.vadNoiseFloor,
+      enterThreshold: this.vadEnterThreshold,
+      exitThreshold: this.vadExitThreshold,
+      speechMs: this.vadSpeechMs,
+      silenceMs: this.vadSilenceMs,
+      confidence: this.vadEnterThreshold > 0
+        ? Math.max(
+            0,
+            Math.min(
+              1,
+              (this.vadRms - this.vadNoiseFloor) / Math.max(this.vadEnterThreshold - this.vadNoiseFloor, 1e-4)
+            )
+          )
+        : 0
+    });
   }
 
   private consumeSamples(sampleCount: number): Int16Array {

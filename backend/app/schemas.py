@@ -51,6 +51,7 @@ class ChatRequest(BaseModel):
     text: str = Field(..., description="Speaker utterance")
     speaker_role: str | None = Field(default=None, description="Optional speaker role hint")
     consultation_mode: str = Field(default="consultation", description="consultation or follow_up")
+    response_language: str | None = Field(default=None, description="Preferred output language")
 
 
 class ChatResponse(BaseModel):
@@ -69,6 +70,7 @@ class ChatResponse(BaseModel):
 class StartConsultationRequest(BaseModel):
     session_id: str = Field(default="default")
     consultation_mode: str = Field(default="consultation")
+    response_language: str | None = Field(default=None, description="Preferred output language")
 
 
 class TranscriptSegment(BaseModel):

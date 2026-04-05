@@ -36,6 +36,7 @@ import type {
   FinalEvent,
   HealthResponse,
   KnowledgeHit,
+  LanguageInfoEvent,
   ReportExtractResponse,
   RootInfo,
   SessionDetailResponse,
@@ -83,6 +84,38 @@ type AssistantSpeechMeta = {
   language?: string;
   languages?: string[];
 };
+
+const LANG_DISPLAY_NAMES: Record<string, string> = {
+  en: "English",
+  hi: "Hindi",
+  kn: "Kannada",
+  auto: "Auto",
+  unknown: "Unknown",
+};
+
+function getLanguageLabel(
+  detectedInputLang?: string,
+  isCodeMixed?: boolean,
+  languages?: string[]
+): { label: string; badgeClass: string } {
+  if (isCodeMixed && languages && languages.length > 1) {
+    const langCodes = languages
+      .map((l) => l.toUpperCase())
+      .join("+");
+    return { label: `Code-Mixed (${langCodes})`, badgeClass: "lang-badge-mixed" };
+  }
+  const lang = detectedInputLang || "auto";
+  switch (lang) {
+    case "en":
+      return { label: "English", badgeClass: "lang-badge-en" };
+    case "hi":
+      return { label: "Hindi", badgeClass: "lang-badge-hi" };
+    case "kn":
+      return { label: "Kannada", badgeClass: "lang-badge-kn" };
+    default:
+      return { label: LANG_DISPLAY_NAMES[lang] || lang.toUpperCase(), badgeClass: "lang-badge" };
+  }
+}
 
 const NUDI_WORDMARKS = [
   { script: "\u0ca8\u0cc1\u0ca1\u0cbf", language: "Kannada" },
@@ -169,6 +202,7 @@ export default function App() {
   const [assistantDraft, setAssistantDraft] = useState("");
   const [lastResponse, setLastResponse] = useState<FinalEvent | null>(null);
   const [lastTranscription, setLastTranscription] = useState<TranscriptionEvent | null>(null);
+  const [inputLanguageInfo, setInputLanguageInfo] = useState<LanguageInfoEvent | null>(null);
   const [captureState, setCaptureState] = useState<CaptureState>("idle");
   const [audioConfig, setAudioConfig] = useState<AudioConfigEvent | null>(null);
   const [micLevel, setMicLevel] = useState(0);
@@ -206,6 +240,9 @@ export default function App() {
   const pendingSpeechJobsRef = useRef(0);
   const playbackActiveRef = useRef(false);
   const pausedSpeechRef = useRef(false);
+  const recordedClipRef = useRef<Blob | null>(null);
+  const latestVoiceFinalRef = useRef<FinalEvent | null>(null);
+  const latestVoiceTranscriptionRef = useRef<TranscriptionEvent | null>(null);
   const deferredSessionDetail = useDeferredValue(sessionDetail);
   const deferredActivities = useDeferredValue(activities);
 
@@ -328,71 +365,18 @@ export default function App() {
     const cleanedText = textInput.trim();
     if (!cleanedText || textBusy) return;
 
-    setTextBusy(true);
-    const preferredLanguage = resolveResponseLanguage(responseLanguage);
-    const speechRunId = beginAssistantSpeechRun({ language: preferredLanguage });
-    setAssistantDraft("");
-    setLastResponse(null);
-
-    try {
-      const finalEvent = await streamTextChat(
-        baseUrl, sessionId,
-        {
-          text: cleanedText,
-          speaker_role: speakerRole === "auto" ? undefined : speakerRole,
-          consultation_mode: consultationMode,
-          response_language: preferredLanguage
-        },
-        (eventPayload) => {
-          if (eventPayload.type === "language_info") {
-            speechMetaRef.current = {
-              language: eventPayload.dominant_language || speechMetaRef.current.language,
-              languages: eventPayload.languages || []
-            };
-          }
-          if (eventPayload.type === "delta") {
-            setAssistantDraft((current) => current + eventPayload.text);
-          }
-          if (eventPayload.type === "final") {
-            speechMetaRef.current = {
-              language: eventPayload.tts_language || eventPayload.language,
-              languages: eventPayload.languages || []
-            };
-            if (autoSpeak) {
-              queueAssistantSpeechResponse(speechRunId, eventPayload);
-            }
-            setLastResponse(eventPayload);
-            setAssistantDraft("");
-          }
-        }
-      );
-      setLastResponse(finalEvent);
-      setTextInput("");
-      void refreshSessionDetail({ background: true });
-      pushActivity(setActivities, "info", `Captured ${speakerRole === "auto" ? "auto-detected" : speakerRole} text turn.`);
-    } catch (error) {
-      pushActivity(setActivities, "error", `Text consultation failed: ${formatError(error)}`);
-    } finally {
-      setTextBusy(false);
-    }
+    await submitConsultationTurn(cleanedText, {
+      speakerRoleHint: speakerRole === "auto" ? undefined : speakerRole,
+      activityText: `Captured ${speakerRole === "auto" ? "auto-detected" : speakerRole} text turn.`,
+    });
+    setTextInput("");
   }
 
   async function handleAudioUpload(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file || uploadBusy) return;
-    setUploadBusy(true);
-    try {
-      const result = await transcribeFile(baseUrl, file, sessionId);
-      setAudioUploadResult(result);
-      setLastTranscription({ type: "transcription", ...result, consultation_mode: consultationMode });
-      void refreshSessionDetail({ background: true });
-      pushActivity(setActivities, "info", `Uploaded audio transcribed as ${result.speaker_role} speech.`);
-    } catch (error) {
-      pushActivity(setActivities, "error", `Audio upload failed: ${formatError(error)}`);
-    } finally {
-      setUploadBusy(false);
-    }
+    await handleConsultationAudioFile(file, file.name || "uploaded audio");
   }
 
   async function handleReportUpload(event: ChangeEvent<HTMLInputElement>) {
@@ -417,6 +401,8 @@ export default function App() {
     if (captureState !== "idle") return;
     setCaptureState("connecting");
     setVadState(null);
+    latestVoiceFinalRef.current = null;
+    latestVoiceTranscriptionRef.current = null;
     const preferredLanguage = resolveResponseLanguage(responseLanguage);
     const speechRunId = beginAssistantSpeechRun({ language: preferredLanguage });
     setAssistantDraft("");
@@ -435,7 +421,11 @@ export default function App() {
       const socketSession = createAudioSocketSession(baseUrl, sessionId, socketConfig,
         (eventPayload: AudioStreamEvent) => {
           if (eventPayload.type === "audio_config") setAudioConfig(eventPayload);
-          if (eventPayload.type === "transcription") { setLastTranscription(eventPayload); setCaptureState("responding"); }
+          if (eventPayload.type === "transcription") {
+            latestVoiceTranscriptionRef.current = eventPayload;
+            setLastTranscription(eventPayload);
+            setCaptureState("responding");
+          }
           if (eventPayload.type === "language_info") {
             speechMetaRef.current = {
               language: eventPayload.dominant_language || speechMetaRef.current.language,
@@ -447,6 +437,7 @@ export default function App() {
             setCaptureState("responding");
           }
           if (eventPayload.type === "final") {
+            latestVoiceFinalRef.current = eventPayload;
             speechMetaRef.current = {
               language: eventPayload.tts_language || eventPayload.language,
               languages: eventPayload.languages || []
@@ -494,8 +485,11 @@ export default function App() {
     try {
       const stopResult = await capture.stop();
       if (stopResult.blob) {
+        recordedClipRef.current = stopResult.blob;
         setCapturePreviewUrl((current) => { if (current) URL.revokeObjectURL(current); return URL.createObjectURL(stopResult.blob); });
         setCapturePreviewMeta(`${stopResult.sampleRate} Hz · ${formatDurationSeconds(stopResult.durationSeconds)}`);
+      } else {
+        recordedClipRef.current = null;
       }
       socketSession.commit();
       const completion = await socketSession.completion;
@@ -509,6 +503,20 @@ export default function App() {
         setLastResponse(completion);
         void refreshSessionDetail({ background: true });
         pushActivity(setActivities, "info", `Live turn completed as ${completion.speaker_role || "unknown"} speech.`);
+      } else if (completion.type === "stream_complete") {
+        const streamStatus = completion.status || "";
+        const streamError = typeof completion.details?.error === "string" ? completion.details.error : "";
+        if (streamStatus === "error") {
+          setCaptureState("error");
+          pushActivity(setActivities, "error", streamError || "Live audio consultation did not complete.");
+        } else if (latestVoiceFinalRef.current) {
+          setLastResponse(latestVoiceFinalRef.current);
+          void refreshSessionDetail({ background: true });
+          setCaptureState("idle");
+        } else {
+          setCaptureState("idle");
+          pushActivity(setActivities, "warning", "No assistant reply arrived from live voice. Use the recorded-audio upload fallback below.");
+        }
       } else if (completion.type === "audio_skipped") {
         pushActivity(setActivities, "warning", "Captured audio was treated as silence.");
         setCaptureState("idle");
@@ -550,18 +558,24 @@ export default function App() {
             turnCount += 1;
             const speakerIndex = turnCount % 2 === 1 ? 1 : 2;
             const speaker = `Speaker ${speakerIndex}`;
+            const detectedInputLang = eventPayload.detected_input_language || eventPayload.language || eventPayload.languages?.[0] || "auto";
+            const detectedLanguage = eventPayload.language || eventPayload.languages?.[0] || "auto";
+            const codeMixed = eventPayload.is_code_mixed || false;
+            const languageInfo = getLanguageLabel(detectedInputLang, codeMixed, eventPayload.languages);
             const newLine: TranscriptLine = {
               id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}`,
               speaker,
               speaker_role: eventPayload.speaker_role || undefined,
               text: eventPayload.text,
               timestamp: new Date().toLocaleTimeString(),
-              language: eventPayload.language || "auto"
+              language: detectedLanguage,
+              detected_input_language: detectedInputLang,
+              is_code_mixed: codeMixed,
             };
             setTranscriptLines((prev) => [...prev, newLine]);
             setTranscriptText((prev) => {
               const speakerLabel = newLine.speaker_role ? `${newLine.speaker} (${newLine.speaker_role})` : newLine.speaker;
-              return prev + `[${newLine.timestamp}] ${speakerLabel}: ${newLine.text}\n`;
+              return prev + `[${newLine.timestamp}] ${speakerLabel} [${languageInfo.label.toUpperCase()}]: ${newLine.text}\n`;
             });
             setCaptureState("recording");
           }
@@ -621,12 +635,121 @@ export default function App() {
     URL.revokeObjectURL(url);
   }
 
+  async function submitConsultationTurn(
+    cleanedText: string,
+    options?: {
+      speakerRoleHint?: string;
+      detectedLanguageHint?: string;
+      activityText?: string;
+    }
+  ) {
+    if (!cleanedText.trim()) {
+      return;
+    }
+
+    setTextBusy(true);
+    const explicitLanguage = resolveResponseLanguage(responseLanguage);
+    const detectedLanguage =
+      options?.detectedLanguageHint && ["en", "hi", "kn"].includes(options.detectedLanguageHint)
+        ? options.detectedLanguageHint
+        : undefined;
+    const responseLanguageHint = explicitLanguage || detectedLanguage;
+    const speechRunId = beginAssistantSpeechRun({ language: responseLanguageHint });
+    setAssistantDraft("");
+    setLastResponse(null);
+
+    try {
+      const finalEvent = await streamTextChat(
+        baseUrl,
+        sessionId,
+        {
+          text: cleanedText,
+          speaker_role: options?.speakerRoleHint,
+          consultation_mode: consultationMode,
+          response_language: responseLanguageHint,
+        },
+        (eventPayload) => {
+          if (eventPayload.type === "language_info") {
+            speechMetaRef.current = {
+              language: eventPayload.dominant_language || speechMetaRef.current.language,
+              languages: eventPayload.languages || []
+            };
+            setInputLanguageInfo(eventPayload);
+          }
+          if (eventPayload.type === "delta") {
+            setAssistantDraft((current) => current + eventPayload.text);
+          }
+          if (eventPayload.type === "final") {
+            speechMetaRef.current = {
+              language: eventPayload.tts_language || eventPayload.language,
+              languages: eventPayload.languages || []
+            };
+            if (autoSpeak) {
+              queueAssistantSpeechResponse(speechRunId, eventPayload);
+            }
+            setLastResponse(eventPayload);
+            setAssistantDraft("");
+          }
+        }
+      );
+      setLastResponse(finalEvent);
+      void refreshSessionDetail({ background: true });
+      if (options?.activityText) {
+        pushActivity(setActivities, "info", options.activityText);
+      }
+    } catch (error) {
+      pushActivity(setActivities, "error", `Consultation failed: ${formatError(error)}`);
+    } finally {
+      setTextBusy(false);
+    }
+  }
+
+  async function handleConsultationAudioFile(file: File, sourceLabel: string) {
+    setUploadBusy(true);
+    try {
+      const result = await transcribeFile(baseUrl, file, sessionId);
+      setAudioUploadResult(result);
+      const transcriptionEvent: TranscriptionEvent = { type: "transcription", ...result, consultation_mode: consultationMode };
+      setLastTranscription(transcriptionEvent);
+      latestVoiceTranscriptionRef.current = transcriptionEvent;
+      void refreshSessionDetail({ background: true });
+
+      if (currentView === "consultation_voice") {
+        await submitConsultationTurn(result.text, {
+          speakerRoleHint: result.speaker_role || undefined,
+          detectedLanguageHint: result.language,
+          activityText: `Uploaded ${sourceLabel} and generated consultation output in ${result.language.toUpperCase()}.`,
+        });
+      } else {
+        pushActivity(setActivities, "info", `Uploaded ${sourceLabel} transcribed as ${result.speaker_role} speech.`);
+      }
+    } catch (error) {
+      pushActivity(setActivities, "error", `Audio upload failed: ${formatError(error)}`);
+    } finally {
+      setUploadBusy(false);
+    }
+  }
+
+  async function uploadRecordedConsultationAudio() {
+    const blob = recordedClipRef.current;
+    if (!blob || uploadBusy) {
+      return;
+    }
+
+    const file = new File(
+      [blob],
+      `recorded_consultation_${sessionId}_${Date.now()}.wav`,
+      { type: blob.type || "audio/wav" }
+    );
+    await handleConsultationAudioFile(file, "recorded audio");
+  }
+
   async function handleClearSession() {
     try {
       await clearSession(baseUrl, sessionId);
       setSessionDetail(null); setReportDraft(blankReport()); setLastResponse(null);
       setLastTranscription(null); setAudioUploadResult(null); setReportUploadResult(null);
-      setAssistantDraft(""); clearGeneratedAudio(); setVadState(null);
+      setAssistantDraft(""); clearGeneratedAudio(); setVadState(null); setInputLanguageInfo(null);
       pushActivity(setActivities, "warning", `Cleared session ${sessionId}.`);
     } catch (error) {
       pushActivity(setActivities, "error", `Unable to clear session: ${formatError(error)}`);
@@ -637,7 +760,7 @@ export default function App() {
     const nextSessionId = buildSessionId();
     setSessionId(nextSessionId); setSessionDetail(null); setReportDraft(blankReport());
     setLastResponse(null); setLastTranscription(null); setAudioUploadResult(null);
-    setReportUploadResult(null); setAssistantDraft(""); clearGeneratedAudio(); setVadState(null);
+    setReportUploadResult(null); setAssistantDraft(""); clearGeneratedAudio(); setVadState(null); setInputLanguageInfo(null);
     setTranscriptLines([]); setTranscriptText("");
     pushActivity(setActivities, "info", `Created new healthcare session ${nextSessionId}.`);
   }
@@ -831,6 +954,7 @@ export default function App() {
 
   function clearGeneratedAudio() {
     clearAssistantAudio(true);
+    recordedClipRef.current = null;
     setCapturePreviewUrl((current) => { if (current) URL.revokeObjectURL(current); return ""; });
     setCapturePreviewMeta("");
   }
@@ -1080,7 +1204,7 @@ export default function App() {
                 {currentView === "consultation_text" ? (
                   <article className="card">
                     <h3>Patient Input</h3>
-                    <p className="supporting-copy">Type in English, Hindi, Kannada, or code-mixed speech. Replies stay concise, operationally clear, and optimized for fast review.</p>
+                    <p className="supporting-copy">Type in English, Hindi, Kannada, or code-mixed speech. The system auto-detects your input language and provides consultation accordingly.</p>
                     <form className="composer" onSubmit={handleTextSubmit}>
                       <textarea rows={4} value={textInput} onChange={(e) => setTextInput(e.target.value)}
                         placeholder="Describe the symptom, duration, medicines, or follow-up update..." />
@@ -1088,6 +1212,20 @@ export default function App() {
                         {textBusy ? "Sending..." : "Send"}
                       </button>
                     </form>
+                    {inputLanguageInfo && (
+                      <div className="chip-row" style={{ marginTop: "8px" }}>
+                        <span className="data-chip">Detected input</span>
+                        {(() => {
+                          const info = getLanguageLabel(
+                            inputLanguageInfo.dominant_language,
+                            inputLanguageInfo.is_code_mixed,
+                            inputLanguageInfo.languages
+                          );
+                          return <span className={`lang-badge ${info.badgeClass}`}>{info.label}</span>;
+                        })()}
+                        {inputLanguageInfo.is_code_mixed && <span className="data-chip">Code-Mixed</span>}
+                      </div>
+                    )}
                   </article>
                 ) : (
                   <article className="card">
@@ -1108,6 +1246,14 @@ export default function App() {
                     <div className="inline-meta">
                       <span>{audioConfig ? `${audioConfig.sample_rate} Hz` : "Awaiting connection"}</span>
                       <span>{formatDurationSeconds(recordingSeconds)}</span>
+                      {lastTranscription ? (() => {
+                        const info = getLanguageLabel(
+                          lastTranscription.detected_input_language || lastTranscription.language,
+                          lastTranscription.is_code_mixed,
+                          lastTranscription.languages
+                        );
+                        return <span className={`lang-badge ${info.badgeClass}`}>{info.label}</span>;
+                      })() : <span>Language detection pending</span>}
                     </div>
                     <div className="button-row">
                       <button className="primary-button" type="button" onClick={startRecording} disabled={captureState !== "idle"}>
@@ -1121,6 +1267,17 @@ export default function App() {
                       <div className="mini-block">
                         <audio controls src={capturePreviewUrl} />
                         <p className="supporting-copy">{capturePreviewMeta}</p>
+                        <div className="button-row">
+                          <button
+                            className="primary-button"
+                            type="button"
+                            onClick={uploadRecordedConsultationAudio}
+                            disabled={uploadBusy}
+                          >
+                            {uploadBusy ? "Uploading..." : "Upload Recording"}
+                          </button>
+                          <span className="data-chip">Fallback if live voice misses the assistant reply</span>
+                        </div>
                       </div>
                     )}
                   </article>
@@ -1146,25 +1303,53 @@ export default function App() {
                 {/* Transcription result */}
                 <article className="card">
                   <h3>Transcript Capture</h3>
-                  {lastTranscription ? (
-                    <>
-                      <div className="chip-row">
-                        <span className="data-chip">{lastTranscription.speaker_role}</span>
-                        <span className="lang-badge">{lastTranscription.language}</span>
-                        {lastTranscription.languages.map((l) => <span className="data-chip" key={l}>{l}</span>)}
-                      </div>
-                      <p>{lastTranscription.text}</p>
-                    </>
-                  ) : audioUploadResult ? (
-                    <>
-                      <div className="chip-row">
-                        <span className="data-chip">{audioUploadResult.speaker_role}</span>
-                        <span className="lang-badge">{audioUploadResult.language}</span>
-                      </div>
-                      <p>{audioUploadResult.text}</p>
-                    </>
-                  ) : (
-                    <EmptyState title="No turn captured" copy="Record or upload speech to see transcript." />
+                  {lastTranscription ? (() => {
+                    const langInfo = getLanguageLabel(
+                      lastTranscription.detected_input_language || lastTranscription.language,
+                      lastTranscription.is_code_mixed,
+                      lastTranscription.languages
+                    );
+                    return (
+                      <>
+                        <div className="chip-row">
+                          <span className="data-chip">{lastTranscription.speaker_role}</span>
+                          <span className={`lang-badge ${langInfo.badgeClass}`}>{langInfo.label}</span>
+                          {lastTranscription.is_code_mixed && (
+                            <span className="lang-badge lang-badge-mixed">Code-Mixed</span>
+                          )}
+                        </div>
+                        <p>{lastTranscription.text}</p>
+                        {lastTranscription.languages.length > 1 && (
+                          <div className="chip-row">
+                            <span className="data-chip" style={{ fontSize: "0.75rem" }}>Languages detected:</span>
+                            {lastTranscription.languages.map((l) => {
+                              const lInfo = getLanguageLabel(l, false, [l]);
+                              return <span className={`lang-badge ${lInfo.badgeClass}`} key={l} style={{ fontSize: "0.72rem", padding: "3px 8px" }}>{lInfo.label}</span>;
+                            })}
+                          </div>
+                        )}
+                      </>
+                    );
+                  })() : audioUploadResult ? (() => {
+                    const langInfo = getLanguageLabel(
+                      audioUploadResult.detected_input_language || audioUploadResult.language,
+                      audioUploadResult.is_code_mixed,
+                      audioUploadResult.languages
+                    );
+                    return (
+                      <>
+                        <div className="chip-row">
+                          <span className="data-chip">{audioUploadResult.speaker_role}</span>
+                          <span className={`lang-badge ${langInfo.badgeClass}`}>{langInfo.label}</span>
+                          {audioUploadResult.is_code_mixed && (
+                            <span className="lang-badge lang-badge-mixed">Code-Mixed</span>
+                          )}
+                        </div>
+                        <p>{audioUploadResult.text}</p>
+                      </>
+                    );
+                  })() : (
+                    <EmptyState title="No turn captured" copy="Record or upload speech to see transcript and start medical consultation." />
                   )}
                 </article>
 
@@ -1184,14 +1369,14 @@ export default function App() {
                     </div>
                   )}
                   <div className="button-row speech-controls">
-                    <button className="ghost-button" type="button" onClick={pauseAssistantSpeech} disabled={!ttsAudioUrl || ttsPaused}>
-                      Pause speech
+                    <button className="ghost-button icon-button" type="button" title="Pause speech" aria-label="Pause speech" onClick={pauseAssistantSpeech} disabled={!ttsAudioUrl || ttsPaused}>
+                      ⏸
                     </button>
-                    <button className="ghost-button" type="button" onClick={resumeAssistantSpeech} disabled={!ttsPaused}>
-                      Resume speech
+                    <button className="ghost-button icon-button" type="button" title="Resume speech" aria-label="Resume speech" onClick={resumeAssistantSpeech} disabled={!ttsPaused}>
+                      ▶
                     </button>
-                    <button className="ghost-button" type="button" onClick={stopAssistantSpeech} disabled={!ttsAudioUrl && !ttsBusy}>
-                      Stop speech
+                    <button className="ghost-button icon-button" type="button" title="Stop speech" aria-label="Stop speech" onClick={stopAssistantSpeech} disabled={!ttsAudioUrl && !ttsBusy}>
+                      ■
                     </button>
                   </div>
                   {ttsPaused && <p className="supporting-copy">Assistant speech is paused.</p>}
@@ -1263,19 +1448,26 @@ export default function App() {
               <EmptyState title="No turns yet" copy="Turns appear here as the session progresses." />
             ) : (
               <div className="turn-list">
-                {consultationTurns.map((turn) => (
-                  <div className={`turn-card ${turn.speaker_role}`} key={`${turn.id || turn.created_at}-${turn.text}`}>
-                    <div className="turn-head">
-                      <span>{turn.speaker_role}</span>
-                      <span>{formatDateValue(turn.created_at)}</span>
+                {consultationTurns.map((turn) => {
+                  const isCodeMixed = turn.languages.length > 1;
+                  const turnLangInfo = getLanguageLabel(turn.language, isCodeMixed, turn.languages);
+                  return (
+                    <div className={`turn-card ${turn.speaker_role}`} key={`${turn.id || turn.created_at}-${turn.text}`}>
+                      <div className="turn-head">
+                        <span>{turn.speaker_role}</span>
+                        <span>{formatDateValue(turn.created_at)}</span>
+                      </div>
+                      <p>{turn.text}</p>
+                      <div className="chip-row">
+                        <span className={`lang-badge ${turnLangInfo.badgeClass}`}>{turnLangInfo.label}</span>
+                        {isCodeMixed && turn.languages.map((l) => {
+                          const lInfo = getLanguageLabel(l, false, [l]);
+                          return <span className={`lang-badge ${lInfo.badgeClass}`} key={`${turn.id}-${l}`} style={{ fontSize: "0.72rem", padding: "3px 8px" }}>{lInfo.label}</span>;
+                        })}
+                      </div>
                     </div>
-                    <p>{turn.text}</p>
-                    <div className="chip-row">
-                      <span className="data-chip">{turn.language}</span>
-                      {turn.languages.map((l) => <span className="data-chip" key={`${turn.id}-${l}`}>{l}</span>)}
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </section>
@@ -1359,7 +1551,9 @@ export default function App() {
           {/* Live transcript lines */}
           {transcriptLines.length > 0 && (
             <div className="turn-list" style={{ marginBottom: "16px" }}>
-              {transcriptLines.map((line) => (
+              {transcriptLines.map((line) => {
+                const langInfo = getLanguageLabel(line.detected_input_language, line.is_code_mixed, line.language ? [line.language] : undefined);
+                return (
                 <div className="turn-card patient" key={line.id}>
                   <div className="turn-head">
                     <span>{line.speaker}</span>
@@ -1367,11 +1561,12 @@ export default function App() {
                   </div>
                   <p>{line.text}</p>
                   <div className="chip-row">
-                    <span className="lang-badge">{line.language}</span>
+                    <span className={`lang-badge ${langInfo.badgeClass}`}>{langInfo.label}</span>
                     {line.speaker_role && <span className="data-chip">{line.speaker_role}</span>}
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
           )}
 

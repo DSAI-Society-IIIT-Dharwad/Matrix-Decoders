@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
@@ -44,6 +45,13 @@ from .schemas import (
 from .training.archive import archive_training_audio
 from .transcript_cleaner import clean_transcript
 from .tts_router import TTSSegmentInput, tts_router
+from .websocket_stream import (
+    build_stream_complete_event,
+    build_stream_started_event,
+    enrich_stream_event,
+    new_stream_state,
+    utc_now_iso,
+)
 
 log = get_logger("api")
 
@@ -58,6 +66,16 @@ _ALLOWED_AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg", ".webm", ".flac"}
 
 def _elapsed_ms(started_at: float) -> int:
     return int((time.perf_counter() - started_at) * 1000)
+
+
+def _coerce_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return False
 
 
 def _build_tts_segment_inputs(
@@ -141,13 +159,15 @@ async def health_check():
 @router.post("/api/consultation/start", response_model=ChatResponse)
 async def start_consultation(request: StartConsultationRequest):
     consultation_mode = normalize_consultation_mode(request.consultation_mode)
-    opening_prompt = build_opening_assistant_prompt(consultation_mode)
+    response_language = request.response_language if request.response_language in {"en", "hi", "kn"} else "en"
+    opening_prompt = build_opening_assistant_prompt(consultation_mode, response_language=response_language)
     store.add(request.session_id, "assistant", opening_prompt)
+    store.set_selected_language(request.session_id, response_language)
     snapshot = _augment_session_snapshot(store.get_session_snapshot(request.session_id)) or {}
     return ChatResponse(
         text=opening_prompt,
-        language="en",
-        languages=list(snapshot.get("languages", ["en"])),
+        language=response_language,
+        languages=list(snapshot.get("languages", [response_language])),
         is_code_mixed=False,
         session_id=request.session_id,
         speaker_role="assistant",
@@ -177,6 +197,7 @@ async def chat(request: ChatRequest):
         cleaned_text,
         speaker_role_hint=request.speaker_role,
         consultation_mode=request.consultation_mode,
+        preferred_response_language=request.response_language,
     ):
         if event["type"] == "delta":
             response_text += event["text"]
@@ -505,17 +526,64 @@ async def text_ws(ws: WebSocket, session_id: str):
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
-                await ws.send_json({"type": "error", "error": "Invalid JSON"})
+                await ws.send_json(
+                    {
+                        "type": "error",
+                        "error": "Invalid JSON",
+                        "session_id": session_id,
+                        "channel": "text",
+                        "emitted_at": utc_now_iso(),
+                    }
+                )
+                continue
+
+            if msg.get("type") == "ping":
+                await ws.send_json(
+                    {
+                        "type": "pong",
+                        "session_id": session_id,
+                        "channel": "text",
+                        "emitted_at": utc_now_iso(),
+                    }
+                )
                 continue
 
             if msg.get("type") != "input":
-                await ws.send_json({"type": "error", "error": "Expected {type: 'input', text: '...'}"})
+                await ws.send_json(
+                    {
+                        "type": "error",
+                        "error": "Expected {type: 'input', text: '...'}",
+                        "session_id": session_id,
+                        "channel": "text",
+                        "emitted_at": utc_now_iso(),
+                    }
+                )
                 continue
 
             cleaned_text = clean_transcript(msg.get("text", ""))
             if not cleaned_text:
-                await ws.send_json({"type": "error", "error": "Text input cannot be empty."})
+                await ws.send_json(
+                    {
+                        "type": "error",
+                        "error": "Text input cannot be empty.",
+                        "session_id": session_id,
+                        "channel": "text",
+                        "emitted_at": utc_now_iso(),
+                    }
+                )
                 continue
+
+            stream_state = new_stream_state("text", session_id)
+            await ws.send_json(
+                build_stream_started_event(
+                    stream_state,
+                    {
+                        "consultation_mode": normalize_consultation_mode(msg.get("consultation_mode")),
+                        "speaker_role_hint": msg.get("speaker_role") or "",
+                        "response_language": msg.get("response_language") or "",
+                    },
+                )
+            )
 
             final_event = None
             pipeline_error = None
@@ -524,8 +592,10 @@ async def text_ws(ws: WebSocket, session_id: str):
                 cleaned_text,
                 speaker_role_hint=msg.get("speaker_role"),
                 consultation_mode=msg.get("consultation_mode", "consultation"),
+                preferred_response_language=msg.get("response_language"),
             ):
-                await ws.send_json(event)
+                enriched_event = enrich_stream_event(stream_state, event)
+                await ws.send_json(enriched_event)
                 if event["type"] == "final":
                     final_event = event
                 elif event["type"] == "error":
@@ -535,6 +605,14 @@ async def text_ws(ws: WebSocket, session_id: str):
             if pipeline_error:
                 store.record_error(session_id, "ws.text", pipeline_error)
                 store.record_latency(session_id, "ws.text", latency_ms, status="error")
+                await ws.send_json(
+                    build_stream_complete_event(
+                        stream_state,
+                        "error",
+                        latency_ms,
+                        {"error": pipeline_error},
+                    )
+                )
                 continue
 
             if final_event:
@@ -547,6 +625,21 @@ async def text_ws(ws: WebSocket, session_id: str):
                         "speaker_role": final_event.get("speaker_role", ""),
                         "consultation_mode": final_event.get("consultation_mode", ""),
                     },
+                )
+                await ws.send_json(
+                    build_stream_complete_event(
+                        stream_state,
+                        "ok",
+                        latency_ms,
+                        {
+                            "speaker_role": final_event.get("speaker_role", ""),
+                            "consultation_mode": final_event.get("consultation_mode", ""),
+                        },
+                    )
+                )
+            else:
+                await ws.send_json(
+                    build_stream_complete_event(stream_state, "incomplete", latency_ms)
                 )
     except WebSocketDisconnect:
         log.info(f"Text consultation WebSocket disconnected: session={session_id}")
@@ -571,18 +664,50 @@ async def audio_ws(ws: WebSocket, session_id: str):
     commit_driven_mode = False
     consultation_mode = "consultation"
     speaker_role_hint = None
-    silence_timeout = 1.2
+    silence_timeout: float | None = None
+    preferred_response_language = None
+    transcription_only = False
 
     async def flush_audio_buffer():
         nonlocal audio_buffer
 
+        stream_state = new_stream_state("audio", session_id)
+
         if not audio_buffer:
+            await ws.send_json(
+                enrich_stream_event(
+                    stream_state,
+                    {"type": "audio_skipped", "reason": "empty"},
+                )
+            )
+            await ws.send_json(build_stream_complete_event(stream_state, "skipped", 0))
             return
+
+        raw_bytes = len(audio_buffer)
+        await ws.send_json(
+            build_stream_started_event(
+                stream_state,
+                {
+                    "raw_audio_bytes": raw_bytes,
+                    "sample_rate": audio_config.sample_rate,
+                    "channels": audio_config.channels,
+                    "consultation_mode": consultation_mode,
+                    "commit_driven_mode": commit_driven_mode,
+                    "transcription_only": transcription_only,
+                },
+            )
+        )
 
         pcm_audio = trim_pcm16_silence(bytes(audio_buffer), channels=audio_config.channels)
         audio_buffer.clear()
         if not pcm_audio:
-            await ws.send_json({"type": "audio_skipped", "reason": "silence"})
+            await ws.send_json(
+                enrich_stream_event(
+                    stream_state,
+                    {"type": "audio_skipped", "reason": "silence"},
+                )
+            )
+            await ws.send_json(build_stream_complete_event(stream_state, "skipped", 0))
             return
 
         temp_dir = Path("temp_audio")
@@ -601,19 +726,38 @@ async def audio_ws(ws: WebSocket, session_id: str):
             final_event = None
             pipeline_error = None
 
-            async for event in orch.process_audio(
-                session_id,
-                str(temp_path),
-                consultation_mode=consultation_mode,
-                speaker_role_hint=speaker_role_hint,
-            ):
-                if event["type"] == "transcription":
-                    transcription_event = event
-                elif event["type"] == "final":
-                    final_event = event
-                elif event["type"] == "error":
-                    pipeline_error = event.get("error", "Unknown audio pipeline error")
-                await ws.send_json(event)
+            if transcription_only:
+                result = await asr_router.transcribe_full(str(temp_path))
+                if not result.text.strip():
+                    pipeline_error = "Could not transcribe audio. Please speak louder or more clearly."
+                else:
+                    transcription_event = {
+                        "type": "transcription",
+                        "text": result.text,
+                        "language": result.dominant_language,
+                        "detected_input_language": result.detected_input_language,
+                        "languages": list(result.languages),
+                        "is_code_mixed": result.is_code_mixed,
+                        "segments": result.segments,
+                        "speaker_role": "",
+                        "consultation_mode": consultation_mode,
+                    }
+                    await ws.send_json(enrich_stream_event(stream_state, transcription_event))
+            else:
+                async for event in orch.process_audio(
+                    session_id,
+                    str(temp_path),
+                    consultation_mode=consultation_mode,
+                    speaker_role_hint=speaker_role_hint,
+                    preferred_response_language=preferred_response_language,
+                ):
+                    if event["type"] == "transcription":
+                        transcription_event = event
+                    elif event["type"] == "final":
+                        final_event = event
+                    elif event["type"] == "error":
+                        pipeline_error = event.get("error", "Unknown audio pipeline error")
+                    await ws.send_json(enrich_stream_event(stream_state, event))
 
             if transcription_event:
                 store.record_transcript(
@@ -629,6 +773,7 @@ async def audio_ws(ws: WebSocket, session_id: str):
                         "channels": audio_config.channels,
                         "speaker_role": transcription_event.get("speaker_role", ""),
                         "consultation_mode": consultation_mode,
+                        "transcription_only": transcription_only,
                     },
                 )
                 archive_training_audio(
@@ -639,13 +784,24 @@ async def audio_ws(ws: WebSocket, session_id: str):
                     is_code_mixed=bool(transcription_event.get("is_code_mixed", False)),
                     source="ws.audio",
                     session_id=session_id,
-                    details={"speaker_role": transcription_event.get("speaker_role", "")},
+                    details={
+                        "speaker_role": transcription_event.get("speaker_role", ""),
+                        "transcription_only": transcription_only,
+                    },
                 )
 
             latency_ms = _elapsed_ms(started_at)
             if pipeline_error:
                 store.record_error(session_id, "ws.audio", pipeline_error)
                 store.record_latency(session_id, "ws.audio", latency_ms, status="error")
+                await ws.send_json(
+                    build_stream_complete_event(
+                        stream_state,
+                        "error",
+                        latency_ms,
+                        {"error": pipeline_error},
+                    )
+                )
             elif final_event:
                 store.record_latency(
                     session_id,
@@ -657,18 +813,51 @@ async def audio_ws(ws: WebSocket, session_id: str):
                         "consultation_mode": final_event.get("consultation_mode", ""),
                     },
                 )
+                await ws.send_json(
+                    build_stream_complete_event(
+                        stream_state,
+                        "ok",
+                        latency_ms,
+                        {
+                            "speaker_role": final_event.get("speaker_role", ""),
+                            "consultation_mode": final_event.get("consultation_mode", ""),
+                        },
+                    )
+                )
+            else:
+                await ws.send_json(build_stream_complete_event(stream_state, "incomplete", latency_ms))
         except Exception as exc:
             log.error(f"Audio processing error: {exc}")
             store.record_error(session_id, "ws.audio", str(exc))
-            store.record_latency(session_id, "ws.audio", _elapsed_ms(started_at), status="error")
-            await ws.send_json({"type": "error", "error": str(exc)})
+            latency_ms = _elapsed_ms(started_at)
+            store.record_latency(session_id, "ws.audio", latency_ms, status="error")
+            await ws.send_json(
+                enrich_stream_event(stream_state, {"type": "error", "error": str(exc)})
+            )
+            await ws.send_json(
+                build_stream_complete_event(stream_state, "error", latency_ms, {"error": str(exc)})
+            )
         finally:
             if temp_path.exists():
                 temp_path.unlink()
 
     try:
         while True:
-            data = await ws.receive()
+            try:
+                data = await asyncio.wait_for(ws.receive(), timeout=0.1)
+            except asyncio.TimeoutError:
+                data = None
+
+            if data is None:
+                current_time = time.time()
+                max_buffer_size = audio_config.max_buffer_bytes()
+                timed_out = silence_timeout is not None and current_time - last_audio_time > silence_timeout
+                should_flush = timed_out
+                if not commit_driven_mode:
+                    should_flush = should_flush or len(audio_buffer) >= max_buffer_size
+                if audio_buffer and should_flush:
+                    await flush_audio_buffer()
+                continue
 
             if "bytes" in data and data["bytes"] is not None:
                 chunk = data["bytes"]
@@ -695,6 +884,16 @@ async def audio_ws(ws: WebSocket, session_id: str):
                         commit_driven_mode = True
                         consultation_mode = normalize_consultation_mode(payload.get("consultation_mode"))
                         speaker_role_hint = payload.get("speaker_role")
+                        preferred_response_language = payload.get("response_language")
+                        transcription_only = _coerce_bool(payload.get("transcription_only"))
+                        raw_turn_timeout = payload.get("turn_timeout_seconds")
+                        if raw_turn_timeout in {None, ""}:
+                            silence_timeout = None
+                        else:
+                            try:
+                                silence_timeout = max(0.35, min(float(raw_turn_timeout), 3.0))
+                            except (TypeError, ValueError):
+                                silence_timeout = None
                         await ws.send_json(
                             {
                                 "type": "audio_config",
@@ -704,6 +903,12 @@ async def audio_ws(ws: WebSocket, session_id: str):
                                 "encoding": audio_config.encoding,
                                 "max_chunk_bytes": audio_config.max_chunk_bytes(),
                                 "consultation_mode": consultation_mode,
+                                "response_language": preferred_response_language or "",
+                                "transcription_only": transcription_only,
+                                "turn_timeout_seconds": silence_timeout,
+                                "session_id": session_id,
+                                "channel": "audio",
+                                "emitted_at": utc_now_iso(),
                             }
                         )
                         continue
@@ -712,10 +917,24 @@ async def audio_ws(ws: WebSocket, session_id: str):
                         continue
                     if message_type == "reset":
                         audio_buffer.clear()
-                        await ws.send_json({"type": "audio_reset"})
+                        await ws.send_json(
+                            {
+                                "type": "audio_reset",
+                                "session_id": session_id,
+                                "channel": "audio",
+                                "emitted_at": utc_now_iso(),
+                            }
+                        )
                         continue
                     if message_type == "ping":
-                        await ws.send_json({"type": "pong"})
+                        await ws.send_json(
+                            {
+                                "type": "pong",
+                                "session_id": session_id,
+                                "channel": "audio",
+                                "emitted_at": utc_now_iso(),
+                            }
+                        )
                         continue
 
                 command = raw_text.lower()
@@ -724,21 +943,28 @@ async def audio_ws(ws: WebSocket, session_id: str):
                     continue
                 if command == "reset":
                     audio_buffer.clear()
-                    await ws.send_json({"type": "audio_reset"})
+                    await ws.send_json(
+                        {
+                            "type": "audio_reset",
+                            "session_id": session_id,
+                            "channel": "audio",
+                            "emitted_at": utc_now_iso(),
+                        }
+                    )
                     continue
                 if command == "ping":
-                    await ws.send_json({"type": "pong"})
+                    await ws.send_json(
+                        {
+                            "type": "pong",
+                            "session_id": session_id,
+                            "channel": "audio",
+                            "emitted_at": utc_now_iso(),
+                        }
+                    )
                     continue
                 await ws.send_json({"type": "error", "error": "Unsupported audio control message."})
                 continue
 
-            current_time = time.time()
-            max_buffer_size = audio_config.max_buffer_bytes()
-            should_flush = current_time - last_audio_time > silence_timeout
-            if not commit_driven_mode:
-                should_flush = should_flush or len(audio_buffer) >= max_buffer_size
-            if audio_buffer and should_flush:
-                await flush_audio_buffer()
     except WebSocketDisconnect:
         log.info(f"Audio consultation WebSocket disconnected: session={session_id}")
     except Exception as exc:
@@ -762,16 +988,51 @@ async def tts_ws(ws: WebSocket, session_id: str):
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
-                await ws.send_json({"type": "error", "error": "Invalid JSON"})
+                await ws.send_json(
+                    {
+                        "type": "error",
+                        "error": "Invalid JSON",
+                        "session_id": session_id,
+                        "channel": "tts",
+                        "emitted_at": utc_now_iso(),
+                    }
+                )
+                continue
+
+            if msg.get("type") == "ping":
+                await ws.send_json(
+                    {
+                        "type": "pong",
+                        "session_id": session_id,
+                        "channel": "tts",
+                        "emitted_at": utc_now_iso(),
+                    }
+                )
                 continue
 
             if msg.get("type") != "synthesize":
-                await ws.send_json({"type": "error", "error": "Expected {type: 'synthesize', text: '...'}"})
+                await ws.send_json(
+                    {
+                        "type": "error",
+                        "error": "Expected {type: 'synthesize', text: '...'}",
+                        "session_id": session_id,
+                        "channel": "tts",
+                        "emitted_at": utc_now_iso(),
+                    }
+                )
                 continue
 
             cleaned_text = clean_transcript(msg.get("text", ""))
             if not cleaned_text:
-                await ws.send_json({"type": "error", "error": "TTS input cannot be empty."})
+                await ws.send_json(
+                    {
+                        "type": "error",
+                        "error": "TTS input cannot be empty.",
+                        "session_id": session_id,
+                        "channel": "tts",
+                        "emitted_at": utc_now_iso(),
+                    }
+                )
                 continue
 
             segments = _build_tts_segment_inputs(
@@ -780,13 +1041,26 @@ async def tts_ws(ws: WebSocket, session_id: str):
                 fallback_languages=msg.get("languages"),
                 fallback_language=msg.get("language"),
             )
+            stream_state = new_stream_state("tts", session_id)
             await ws.send_json(
-                {
-                    "type": "tts_info",
-                    "session_id": session_id,
-                    "segment_count": len(segments),
-                    "available_providers": tts_router.available_providers(),
-                }
+                build_stream_started_event(
+                    stream_state,
+                    {
+                        "segment_count": len(segments),
+                        "preferred_language": msg.get("language") or "",
+                        "languages": msg.get("languages") or [],
+                    },
+                )
+            )
+            await ws.send_json(
+                enrich_stream_event(
+                    stream_state,
+                    {
+                        "type": "tts_info",
+                        "segment_count": len(segments),
+                        "available_providers": tts_router.available_providers(),
+                    },
+                )
             )
 
             try:
@@ -797,48 +1071,73 @@ async def tts_ws(ws: WebSocket, session_id: str):
                 )
             except Exception as exc:
                 store.record_error(session_id, "ws.tts", str(exc))
-                store.record_latency(session_id, "ws.tts", _elapsed_ms(started_at), status="error")
-                await ws.send_json({"type": "error", "error": str(exc)})
+                latency_ms = _elapsed_ms(started_at)
+                store.record_latency(session_id, "ws.tts", latency_ms, status="error")
+                await ws.send_json(
+                    enrich_stream_event(stream_state, {"type": "error", "error": str(exc)})
+                )
+                await ws.send_json(
+                    build_stream_complete_event(stream_state, "error", latency_ms, {"error": str(exc)})
+                )
                 continue
 
             for segment_result in result.segments:
                 await ws.send_json(
-                    {
-                        "type": "audio_chunk",
-                        "segment_index": segment_result.index,
-                        "text": segment_result.text,
-                        "language": segment_result.language,
-                        "provider": segment_result.provider,
-                        "mime_type": segment_result.mime_type,
-                        "sample_rate": segment_result.sample_rate,
-                        "duration_ms": segment_result.duration_ms,
-                        "audio_b64": segment_result.audio_b64,
-                    }
+                    enrich_stream_event(
+                        stream_state,
+                        {
+                            "type": "audio_chunk",
+                            "segment_index": segment_result.index,
+                            "text": segment_result.text,
+                            "language": segment_result.language,
+                            "provider": segment_result.provider,
+                            "mime_type": segment_result.mime_type,
+                            "sample_rate": segment_result.sample_rate,
+                            "duration_ms": segment_result.duration_ms,
+                            "audio_b64": segment_result.audio_b64,
+                        },
+                    )
                 )
 
             await ws.send_json(
-                {
-                    "type": "final",
-                    "status": "ok",
-                    "text": result.text,
-                    "language": result.language,
-                    "provider": result.provider,
-                    "mime_type": result.mime_type,
-                    "sample_rate": result.sample_rate,
-                    "segment_count": len(result.segments),
-                    "audio_b64": result.audio_b64,
-                }
+                enrich_stream_event(
+                    stream_state,
+                    {
+                        "type": "final",
+                        "status": "ok",
+                        "text": result.text,
+                        "language": result.language,
+                        "provider": result.provider,
+                        "mime_type": result.mime_type,
+                        "sample_rate": result.sample_rate,
+                        "segment_count": len(result.segments),
+                        "audio_b64": result.audio_b64,
+                    },
+                )
             )
+            latency_ms = _elapsed_ms(started_at)
             store.record_latency(
                 session_id,
                 "ws.tts",
-                _elapsed_ms(started_at),
+                latency_ms,
                 status="ok",
                 details={
                     "provider": result.provider,
                     "language": result.language,
                     "segment_count": len(result.segments),
                 },
+            )
+            await ws.send_json(
+                build_stream_complete_event(
+                    stream_state,
+                    "ok",
+                    latency_ms,
+                    {
+                        "provider": result.provider,
+                        "language": result.language,
+                        "segment_count": len(result.segments),
+                    },
+                )
             )
     except WebSocketDisconnect:
         log.info(f"TTS WebSocket disconnected: session={session_id}")

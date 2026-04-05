@@ -13,6 +13,7 @@ from app.consultation import (
     shape_assistant_response,
 )
 from app.document_parser import extract_document_text
+from app.prompt import build_healthcare_messages
 
 
 class HealthcareConsultationTests(unittest.TestCase):
@@ -70,8 +71,8 @@ class HealthcareConsultationTests(unittest.TestCase):
             response_language="hi",
         )
 
-        self.assertIn("संक्षिप्त सलाह", response)
-        self.assertIn("डॉक्टर से संपर्क", response)
+        self.assertIn("मुख्य शिकायत", response)
+        self.assertIn("लक्षण", response)
 
     def test_follow_up_response_includes_consultation_guidance(self) -> None:
         response = build_deterministic_response(
@@ -111,6 +112,24 @@ class HealthcareConsultationTests(unittest.TestCase):
         self.assertIn("Monitor cough", response)
         self.assertLessEqual(response.count("?"), 1)
 
+    def test_shape_assistant_response_strips_role_markers_and_falls_back_for_hindi(self) -> None:
+        response = shape_assistant_response(
+            "DOCTOR TURN: since when did it start? PATIENT TURN: two days ago.",
+            speaker_role="patient",
+            consultation_mode="consultation",
+            report={
+                "complaint_query": "मुझे बुखार है",
+                "symptoms": "बुखार",
+                "pending_questions": ["What symptoms are present, and when did they start?"],
+                "red_flags": [],
+            },
+            knowledge_hits=[],
+            response_language="hi",
+        )
+
+        self.assertNotIn("DOCTOR TURN", response)
+        self.assertIn("मुख्य शिकायत", response)
+
     def test_shape_assistant_response_strips_json_artifacts(self) -> None:
         response = shape_assistant_response(
             '```json {"symptoms":"fever","pending_questions":["Since when?"]} ``` '
@@ -131,6 +150,27 @@ class HealthcareConsultationTests(unittest.TestCase):
         self.assertIn("Rest", response)
         self.assertNotIn("{", response)
         self.assertNotIn("pending_questions", response)
+
+    def test_build_healthcare_messages_maps_history_roles_and_marks_short_follow_up_answers(self) -> None:
+        messages = build_healthcare_messages(
+            history=[
+                {"role": "assistant", "content": "When did it start?"},
+                {"role": "patient", "content": "I have fever."},
+            ],
+            user_input="Two days ago",
+            languages={"en"},
+            speaker_role="patient",
+            consultation_mode="consultation",
+            response_language="en",
+            structured_report={},
+            knowledge_hits=[],
+            suggested_questions=[],
+        )
+
+        self.assertEqual(messages[1]["role"], "assistant")
+        self.assertEqual(messages[2]["role"], "user")
+        self.assertIn("PATIENT TURN: I have fever.", messages[2]["content"])
+        self.assertIn("This short reply answers the most recent question", messages[-1]["content"])
 
     def test_consultation_guidance_prefers_existing_treatment_advice(self) -> None:
         guidance = build_consultation_guidance(

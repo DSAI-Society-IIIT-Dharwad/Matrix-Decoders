@@ -8,8 +8,11 @@ from typing import List
 import torch
 import torchaudio
 
+from ..logger import get_logger
+
 
 TARGET_SAMPLE_RATE = 16000
+log = get_logger("asr.segmenter")
 
 
 @dataclass
@@ -34,6 +37,56 @@ def _normalize_waveform(waveform: torch.Tensor, sample_rate: int) -> torch.Tenso
     return waveform
 
 
+def _trim_edges_with_torchaudio_vad(waveform: torch.Tensor) -> torch.Tensor:
+    """Trim non-speech leading/trailing regions using torchaudio VAD when available."""
+    try:
+        vad = torchaudio.transforms.Vad(
+            sample_rate=TARGET_SAMPLE_RATE,
+            trigger_level=7.0,
+            trigger_time=0.20,
+            search_time=0.8,
+            allowed_gap=0.20,
+        )
+        trimmed = vad(waveform)
+        if trimmed.numel() == 0:
+            return waveform
+
+        # Trim trailing silence by applying VAD on reversed waveform.
+        reversed_trimmed = torch.flip(trimmed, dims=[-1])
+        reversed_trimmed = vad(reversed_trimmed)
+        if reversed_trimmed.numel() == 0:
+            return trimmed
+        return torch.flip(reversed_trimmed, dims=[-1])
+    except Exception as exc:
+        log.debug(f"torchaudio VAD trim unavailable, using adaptive frame VAD only: {exc}")
+        return waveform
+
+
+def _estimate_vad_thresholds(energies: list[float], floor_threshold: float) -> tuple[float, float]:
+    if not energies:
+        return floor_threshold, floor_threshold * 0.8
+
+    energy_tensor = torch.tensor(energies, dtype=torch.float32)
+    noise_floor = float(torch.quantile(energy_tensor, 0.20).item())
+    speech_peak = float(torch.quantile(energy_tensor, 0.90).item())
+    dynamic_range = max(speech_peak - noise_floor, 1e-4)
+
+    enter_threshold = max(
+        floor_threshold,
+        noise_floor + dynamic_range * 0.35,
+    )
+    exit_threshold = max(
+        floor_threshold * 0.75,
+        noise_floor + dynamic_range * 0.22,
+    )
+
+    # Ensure stable hysteresis (exit must stay below enter).
+    if exit_threshold >= enter_threshold:
+        exit_threshold = max(enter_threshold * 0.85, floor_threshold * 0.75)
+
+    return enter_threshold, exit_threshold
+
+
 def segment_audio(
     audio_path: str,
     output_dir: str,
@@ -43,11 +96,12 @@ def segment_audio(
     max_segment_ms: int = 8000,
     energy_threshold: float = 0.012,
 ) -> List[AudioSegment]:
-    """Split audio into speech-like segments using frame energy."""
+    """Split audio into speech-like segments using adaptive VAD + hysteresis."""
     waveform, sample_rate = torchaudio.load(audio_path)
     waveform = _normalize_waveform(waveform, sample_rate)
+    waveform = _trim_edges_with_torchaudio_vad(waveform)
 
-    samples = waveform.squeeze(0)
+    samples = waveform.squeeze(0).float()
     total_samples = samples.numel()
     if total_samples == 0:
         return []
@@ -57,37 +111,50 @@ def segment_audio(
     min_silence_frames = max(int(min_silence_ms / frame_ms), 1)
     max_segment_frames = max(int(max_segment_ms / frame_ms), min_speech_frames)
 
-    energies = []
+    energies: list[float] = []
     for start in range(0, total_samples, frame_size):
         frame = samples[start:start + frame_size]
         if frame.numel() == 0:
             continue
-        energies.append(float(torch.sqrt(torch.mean(frame.float() ** 2)).item()))
+        energies.append(float(torch.sqrt(torch.mean(frame ** 2)).item()))
 
     if not energies:
         return []
+
+    enter_threshold, exit_threshold = _estimate_vad_thresholds(energies, floor_threshold=energy_threshold)
+    max_energy = max(energies)
 
     speech_ranges = []
     in_speech = False
     speech_start = 0
     silence_frames = 0
     speech_frames = 0
+    pre_speech_frames = 0
 
     for index, energy in enumerate(energies):
-        if energy >= energy_threshold:
-            if not in_speech:
+        if in_speech:
+            if energy >= exit_threshold:
+                silence_frames = 0
+                speech_frames += 1
+            else:
+                silence_frames += 1
+                if silence_frames >= min_silence_frames:
+                    speech_end = index - silence_frames + 1
+                    if speech_end - speech_start >= min_speech_frames:
+                        speech_ranges.append((speech_start, speech_end))
+                    in_speech = False
+                    silence_frames = 0
+                    speech_frames = 0
+                    pre_speech_frames = 0
+        else:
+            if energy >= enter_threshold:
+                pre_speech_frames += 1
+            else:
+                pre_speech_frames = 0
+            if pre_speech_frames >= min_speech_frames:
                 in_speech = True
-                speech_start = index
-                speech_frames = 0
-            speech_frames += 1
-            silence_frames = 0
-        elif in_speech:
-            silence_frames += 1
-            if silence_frames >= min_silence_frames:
-                speech_end = index - silence_frames + 1
-                if speech_end - speech_start >= min_speech_frames:
-                    speech_ranges.append((speech_start, speech_end))
-                in_speech = False
+                speech_start = max(0, index - pre_speech_frames + 1)
+                speech_frames = pre_speech_frames
                 silence_frames = 0
 
     if in_speech:
@@ -96,6 +163,9 @@ def segment_audio(
             speech_ranges.append((speech_start, speech_end))
 
     if not speech_ranges:
+        # Keep previous fallback behavior only when clear speech energy is present.
+        if max_energy < max(enter_threshold * 1.15, 0.006):
+            return []
         duration_ms = int(total_samples * 1000 / TARGET_SAMPLE_RATE)
         return _save_segments(samples, [(0, len(energies))], output_dir, frame_size, duration_ms)
 

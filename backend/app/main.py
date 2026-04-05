@@ -74,6 +74,7 @@ async def root():
             "editable-review-workflow",
             "report-upload-parsing",
             "longitudinal-session-history",
+            "realtime-websocket-streaming",
             "websocket-audio-consultation",
             "ai4bharat-first-tts-routing",
             "multi-provider-tts-fallbacks",

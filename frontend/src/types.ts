@@ -1,13 +1,17 @@
 export type ConsultationMode = "consultation" | "follow_up";
 export type SpeakerRole = "auto" | "patient" | "doctor" | "assistant" | "document";
+export type ResponseLanguageChoice = "auto" | "en" | "hi" | "kn";
 export type AppView = "landing" | "consultation_text" | "consultation_voice" | "transcription";
 
 export interface TranscriptLine {
   id: string;
   speaker: string;
+  speaker_role?: string;
   text: string;
   timestamp: string;
   language: string;
+  detected_input_language?: string;
+  is_code_mixed?: boolean;
 }
 
 export interface RootInfo {
@@ -102,6 +106,7 @@ export interface ChatResponse {
 export interface TranscribeResponse {
   text: string;
   language: string;
+  detected_input_language?: string;
   languages: string[];
   is_code_mixed: boolean;
   segments: TranscriptSegment[];
@@ -213,11 +218,21 @@ export interface LanguageInfoEvent {
   is_code_mixed?: boolean;
   speaker_role?: string;
   consultation_mode?: ConsultationMode;
+  stream_id?: string;
+  session_id?: string;
+  channel?: string;
+  event_index?: number;
+  emitted_at?: string;
 }
 
 export interface DeltaEvent {
   type: "delta";
   text: string;
+  stream_id?: string;
+  session_id?: string;
+  channel?: string;
+  event_index?: number;
+  emitted_at?: string;
 }
 
 export interface FinalEvent {
@@ -244,11 +259,21 @@ export interface FinalEvent {
   structured_report?: StructuredReport;
   knowledge_hits?: KnowledgeHit[];
   suggested_questions?: string[];
+  stream_id?: string;
+  session_id?: string;
+  channel?: string;
+  event_index?: number;
+  emitted_at?: string;
 }
 
 export interface ErrorEvent {
   type: "error";
   error: string;
+  stream_id?: string;
+  session_id?: string;
+  channel?: string;
+  event_index?: number;
+  emitted_at?: string;
 }
 
 export interface AudioConfigEvent {
@@ -259,24 +284,49 @@ export interface AudioConfigEvent {
   encoding: string;
   max_chunk_bytes: number;
   consultation_mode?: ConsultationMode;
+  response_language?: string;
+  transcription_only?: boolean;
+  turn_timeout_seconds?: number | null;
+  stream_id?: string;
+  session_id?: string;
+  channel?: string;
+  event_index?: number;
+  emitted_at?: string;
 }
 
 export interface AudioSkippedEvent {
   type: "audio_skipped";
   reason: string;
+  stream_id?: string;
+  session_id?: string;
+  channel?: string;
+  event_index?: number;
+  emitted_at?: string;
 }
 
 export interface TranscriptionEvent extends TranscribeResponse {
   type: "transcription";
+  detected_input_language?: string;
   consultation_mode?: ConsultationMode;
+  stream_id?: string;
+  session_id?: string;
+  channel?: string;
+  event_index?: number;
+  emitted_at?: string;
 }
 
 export interface PongEvent {
   type: "pong";
+  session_id?: string;
+  channel?: string;
+  emitted_at?: string;
 }
 
 export interface AudioResetEvent {
   type: "audio_reset";
+  session_id?: string;
+  channel?: string;
+  emitted_at?: string;
 }
 
 export interface TTSInfoEvent {
@@ -284,6 +334,10 @@ export interface TTSInfoEvent {
   session_id: string;
   segment_count: number;
   available_providers: string[];
+  stream_id?: string;
+  channel?: string;
+  event_index?: number;
+  emitted_at?: string;
 }
 
 export interface AudioChunkEvent {
@@ -296,22 +350,65 @@ export interface AudioChunkEvent {
   sample_rate: number;
   duration_ms?: number;
   audio_b64: string;
+  stream_id?: string;
+  session_id?: string;
+  channel?: string;
+  event_index?: number;
+  emitted_at?: string;
 }
 
-export type TextStreamEvent = LanguageInfoEvent | DeltaEvent | FinalEvent | ErrorEvent;
+export interface StreamStartedEvent {
+  type: "stream_started";
+  status: "started";
+  stream_id: string;
+  session_id: string;
+  channel: string;
+  event_index: number;
+  emitted_at: string;
+  details?: Record<string, unknown>;
+}
+
+export interface StreamCompleteEvent {
+  type: "stream_complete";
+  status: string;
+  latency_ms: number;
+  stream_id: string;
+  session_id: string;
+  channel: string;
+  event_index: number;
+  emitted_at: string;
+  details?: Record<string, unknown>;
+}
+
+export type TextStreamEvent =
+  | StreamStartedEvent
+  | LanguageInfoEvent
+  | DeltaEvent
+  | FinalEvent
+  | StreamCompleteEvent
+  | ErrorEvent;
 
 export type AudioStreamEvent =
+  | StreamStartedEvent
   | AudioConfigEvent
   | TranscriptionEvent
   | LanguageInfoEvent
   | DeltaEvent
   | FinalEvent
+  | StreamCompleteEvent
   | AudioSkippedEvent
   | AudioResetEvent
   | PongEvent
   | ErrorEvent;
 
-export type TTSStreamEvent = TTSInfoEvent | AudioChunkEvent | FinalEvent | ErrorEvent;
+export type TTSStreamEvent =
+  | StreamStartedEvent
+  | TTSInfoEvent
+  | AudioChunkEvent
+  | FinalEvent
+  | StreamCompleteEvent
+  | ErrorEvent
+  | PongEvent;
 
 export interface AudioSocketConfig {
   sample_rate: number;
@@ -320,6 +417,9 @@ export interface AudioSocketConfig {
   encoding: string;
   consultation_mode?: ConsultationMode;
   speaker_role?: string;
+  response_language?: string;
+  turn_timeout_seconds?: number;
+  transcription_only?: boolean;
 }
 
 export interface ActivityItem {
