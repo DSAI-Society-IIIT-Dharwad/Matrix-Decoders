@@ -70,8 +70,8 @@ class HealthcareConsultationTests(unittest.TestCase):
             response_language="hi",
         )
 
-        self.assertIn("मुख्य शिकायत", response)
-        self.assertIn("लक्षण", response)
+        self.assertIn("संक्षिप्त सलाह", response)
+        self.assertIn("डॉक्टर से संपर्क", response)
 
     def test_follow_up_response_includes_consultation_guidance(self) -> None:
         response = build_deterministic_response(
@@ -89,7 +89,8 @@ class HealthcareConsultationTests(unittest.TestCase):
         )
 
         self.assertIn("continue the advised medicines", response.lower())
-        self.assertIn("Has the patient improved", response)
+        self.assertNotIn("Has the patient improved", response)
+        self.assertNotIn("?", response)
 
     def test_shape_assistant_response_prepends_guidance_for_follow_up(self) -> None:
         response = shape_assistant_response(
@@ -109,6 +110,27 @@ class HealthcareConsultationTests(unittest.TestCase):
 
         self.assertIn("Monitor cough", response)
         self.assertLessEqual(response.count("?"), 1)
+
+    def test_shape_assistant_response_strips_json_artifacts(self) -> None:
+        response = shape_assistant_response(
+            '```json {"symptoms":"fever","pending_questions":["Since when?"]} ``` '
+            "Rest well and stay hydrated.",
+            speaker_role="patient",
+            consultation_mode="consultation",
+            report={
+                "complaint_query": "fever",
+                "symptoms": "fever",
+                "treatment_advice": "",
+                "pending_questions": [],
+                "red_flags": [],
+            },
+            knowledge_hits=[],
+            response_language="en",
+        )
+
+        self.assertIn("Rest", response)
+        self.assertNotIn("{", response)
+        self.assertNotIn("pending_questions", response)
 
     def test_consultation_guidance_prefers_existing_treatment_advice(self) -> None:
         guidance = build_consultation_guidance(

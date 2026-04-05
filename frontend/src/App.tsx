@@ -81,8 +81,6 @@ type AssistantSpeechMeta = {
   languages?: string[];
 };
 
-const ASSISTANT_TTS_MIN_WORDS = 2;
-
 function blankReport(): StructuredReport {
   return {
     complaint_query: "",
@@ -177,7 +175,6 @@ export default function App() {
   const audioSocketRef = useRef<ReturnType<typeof createAudioSocketSession> | null>(null);
   const audioTimerRef = useRef<number | null>(null);
   const speechRunRef = useRef(0);
-  const speechBufferRef = useRef("");
   const speechQueueRef = useRef<Array<{ url: string; meta: string }>>([]);
   const speechUrlsRef = useRef<string[]>([]);
   const speechAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -277,8 +274,7 @@ export default function App() {
       await refreshSessionDetail();
       pushActivity(setActivities, "info", `${consultationMode === "follow_up" ? "Follow-up" : "Consultation"} flow started.`);
       if (autoSpeak) {
-        speechBufferRef.current = response.text;
-        flushAssistantSpeechBuffer(speechRunId, true);
+        queueAssistantSpeechResponse(speechRunId, syntheticFinal(response));
       }
     } catch (error) {
       pushActivity(setActivities, "error", `Unable to start consultation: ${formatError(error)}`);
@@ -308,10 +304,6 @@ export default function App() {
           }
           if (eventPayload.type === "delta") {
             setAssistantDraft((current) => current + eventPayload.text);
-            if (autoSpeak) {
-              speechBufferRef.current += eventPayload.text;
-              flushAssistantSpeechBuffer(speechRunId);
-            }
           }
           if (eventPayload.type === "final") {
             speechMetaRef.current = {
@@ -319,7 +311,7 @@ export default function App() {
               languages: eventPayload.languages || []
             };
             if (autoSpeak) {
-              flushAssistantSpeechBuffer(speechRunId, true);
+              queueAssistantSpeechResponse(speechRunId, eventPayload);
             }
             setLastResponse(eventPayload);
             setAssistantDraft("");
@@ -402,10 +394,6 @@ export default function App() {
           if (eventPayload.type === "delta") {
             setAssistantDraft((current) => current + eventPayload.text);
             setCaptureState("responding");
-            if (autoSpeak) {
-              speechBufferRef.current += eventPayload.text;
-              flushAssistantSpeechBuffer(speechRunId);
-            }
           }
           if (eventPayload.type === "final") {
             speechMetaRef.current = {
@@ -413,7 +401,7 @@ export default function App() {
               languages: eventPayload.languages || []
             };
             if (autoSpeak) {
-              flushAssistantSpeechBuffer(speechRunId, true);
+              queueAssistantSpeechResponse(speechRunId, eventPayload);
             }
             setLastResponse(eventPayload);
             setAssistantDraft("");
@@ -592,7 +580,6 @@ export default function App() {
     clearAssistantAudio();
     const nextRunId = speechRunRef.current + 1;
     speechRunRef.current = nextRunId;
-    speechBufferRef.current = "";
     speechMetaRef.current = {
       language: meta?.language,
       languages: meta?.languages || []
@@ -601,47 +588,55 @@ export default function App() {
   }
 
   function extractAssistantSpeechChunks(
-    text: string,
-    minWords = ASSISTANT_TTS_MIN_WORDS,
-    force = false
+    text: string
   ): { chunks: string[]; remainder: string } {
-    const words = text.trim().split(/\s+/).filter(Boolean);
-    if (words.length === 0) {
+    const normalized = text.replace(/\s+/g, " ").trim();
+    if (!normalized) {
       return { chunks: [], remainder: "" };
     }
 
-    if (!force && words.length < minWords) {
-      return { chunks: [], remainder: words.join(" ") };
-    }
+    const parts = normalized
+      .split(/(?<=[.!?।])\s+/)
+      .map((part) => part.trim())
+      .filter(Boolean);
 
-    const chunks: string[] = [];
-    while (words.length >= minWords) {
-      chunks.push(words.splice(0, minWords).join(" "));
+    if (parts.length === 0) {
+      return { chunks: [normalized], remainder: "" };
     }
 
     return {
-      chunks,
-      remainder: force ? words.join(" ") : words.join(" ")
+      chunks: parts,
+      remainder: ""
     };
   }
 
-  function flushAssistantSpeechBuffer(runId: number, force = false) {
+  function queueAssistantSpeechResponse(runId: number, response: FinalEvent) {
     if (!autoSpeak || runId !== speechRunRef.current) {
       return;
     }
 
-    const bufferedText = speechBufferRef.current;
-    if (!bufferedText.trim()) {
+    const fallbackLanguage = response.tts_language || response.language || speechMetaRef.current.language;
+    const fallbackLanguages = response.languages || speechMetaRef.current.languages || [];
+    const segments = response.tts_segments?.length
+      ? response.tts_segments
+          .map((segment) => ({
+            text: segment.text.trim(),
+            language: segment.language || fallbackLanguage,
+            languages: segment.languages || fallbackLanguages
+          }))
+          .filter((segment) => segment.text)
+      : extractAssistantSpeechChunks(response.text || "").chunks.map((text) => ({
+          text,
+          language: fallbackLanguage,
+          languages: fallbackLanguages
+        }));
+
+    if (segments.length === 0) {
       return;
     }
 
-    const { chunks, remainder } = extractAssistantSpeechChunks(bufferedText, ASSISTANT_TTS_MIN_WORDS, force);
-    speechBufferRef.current = force ? "" : remainder;
-    const nextSegments = force && remainder.trim() ? [...chunks, remainder.trim()] : chunks;
-    const { language, languages } = speechMetaRef.current;
-
-    for (const chunk of nextSegments) {
-      queueAssistantSpeechSegment(runId, chunk, language, languages);
+    for (const segment of segments) {
+      queueAssistantSpeechSegment(runId, segment.text, segment.language, segment.languages);
     }
   }
 
@@ -754,7 +749,6 @@ export default function App() {
     playbackActiveRef.current = false;
     pausedSpeechRef.current = false;
     speechQueueRef.current = [];
-    speechBufferRef.current = "";
     pendingSpeechJobsRef.current = 0;
     speechAudioRef.current?.pause();
     speechAudioRef.current = null;

@@ -208,7 +208,7 @@ async def chat(request: ChatRequest):
     )
 
     return ChatResponse(
-        text=response_text,
+        text=final_event.get("text", response_text),
         language=final_event.get("language", "en"),
         languages=final_event.get("languages", []),
         is_code_mixed=bool(final_event.get("is_code_mixed", False)),
